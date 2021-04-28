@@ -1,0 +1,19 @@
+diff --git a/vendor/github.com/opencontainers/runc/libcontainer/cgroups/fs/memory.go b/vendor/github.com/opencontainers/runc/libcontainer/cgroups/fs/memory.go
+index 41adcd38f47..fe8a39b1c2f 100644
+--- a/vendor/github.com/opencontainers/runc/libcontainer/cgroups/fs/memory.go
++++ b/vendor/github.com/opencontainers/runc/libcontainer/cgroups/fs/memory.go
+@@ -50,9 +50,11 @@ func (s *MemoryGroup) Apply(path string, d *cgroupData) (err error) {
+ 			// is created by libcontainer, otherwise we might get
+ 			// error when people use `cgroupsPath` to join an existed
+ 			// cgroup whose kernel memory is not initialized.
+-			if err := EnableKernelMemoryAccounting(path); err != nil {
+-				return err
+-			}
++
++			// Don't open KernelMemoryAccounting
++			//if err := EnableKernelMemoryAccounting(path); err != nil {
++			//	return err
++			//}
+ 		}
+ 	}
+ 	defer func() {

@@ -1,0 +1,646 @@
+diff --git a/cmd/kube-scheduler/app/server.go b/cmd/kube-scheduler/app/server.go
+index 8bc747688a3..dbca16f9d4e 100644
+--- a/cmd/kube-scheduler/app/server.go
++++ b/cmd/kube-scheduler/app/server.go
+@@ -144,6 +144,10 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
+ 		return fmt.Errorf("unable to register configz: %s", err)
+ 	}
+ 
++	ctx = context.WithValue(ctx, "podinformer", cc.InformerFactory.Core().V1().Pods())
++	ctx = context.WithValue(ctx, "nodeinformer", cc.InformerFactory.Core().V1().Nodes())
++	ctx = context.WithValue(ctx, "kubeclient", cc.Client)
++
+ 	// Prepare the event broadcaster.
+ 	cc.EventBroadcaster.StartRecordingToSink(ctx.Done())
+ 
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index 575a0a2e102..876615f21e1 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -720,6 +720,12 @@ const (
+ 	//
+ 	// Enables the usage of different protocols in the same Service with type=LoadBalancer
+ 	MixedProtocolLBService featuregate.Feature = "MixedProtocolLBService"
++
++	// owner @tke.tencent
++	// alpha: v1.20
++	//
++	// Schedule pods according to remain resources in available zone.
++	EnableComputeResource featuregate.Feature = "EnableComputeResource"
+ )
+ 
+ func init() {
+@@ -845,4 +851,7 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
+ 	// ...
+ 	HPAScaleToZero:         {Default: false, PreRelease: featuregate.Alpha},
+ 	LegacyNodeRoleBehavior: {Default: true, PreRelease: featuregate.Beta},
++
++	// tke specific features
++	EnableComputeResource:   {Default: true, PreRelease: featuregate.Alpha},
+ }
+diff --git a/pkg/scheduler/algorithmprovider/registry.go b/pkg/scheduler/algorithmprovider/registry.go
+index 0ad2e778834..42f86a692d9 100644
+--- a/pkg/scheduler/algorithmprovider/registry.go
++++ b/pkg/scheduler/algorithmprovider/registry.go
+@@ -18,6 +18,7 @@ package algorithmprovider
+ 
+ import (
+ 	"fmt"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/computeresource"
+ 
+ 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	"k8s.io/klog/v2"
+@@ -27,6 +28,7 @@ import (
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/imagelocality"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/localreplicas"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodename"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeports"
+@@ -101,6 +103,8 @@ func getDefaultConfig() *schedulerapi.Plugins {
+ 				{Name: volumezone.Name},
+ 				{Name: podtopologyspread.Name},
+ 				{Name: interpodaffinity.Name},
++				{Name: computeresource.Name},
++				{Name: localreplicas.Name},
+ 			},
+ 		},
+ 		PostFilter: &schedulerapi.PluginSet{
+@@ -128,6 +132,7 @@ func getDefaultConfig() *schedulerapi.Plugins {
+ 				// - It makes its signal comparable to NodeResourcesLeastAllocated.
+ 				{Name: podtopologyspread.Name, Weight: 2},
+ 				{Name: tainttoleration.Name, Weight: 1},
++				{Name: computeresource.Name, Weight: 1},
+ 			},
+ 		},
+ 		Reserve: &schedulerapi.PluginSet{
+diff --git a/pkg/scheduler/framework/plugins/computeresource/compute_resource.go b/pkg/scheduler/framework/plugins/computeresource/compute_resource.go
+new file mode 100644
+index 00000000000..a762ba89bc0
+--- /dev/null
++++ b/pkg/scheduler/framework/plugins/computeresource/compute_resource.go
+@@ -0,0 +1,145 @@
++package computeresource
++
++import (
++	"context"
++	"fmt"
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/klog/v2"
++	"k8s.io/kubernetes/pkg/scheduler/framework"
++	eklethelper "k8s.io/kubernetes/pkg/scheduler/util"
++)
++
++const (
++	// Name is the name of the plugin used in the plugin registry and configurations.
++	Name = "ComputeResource"
++	preFilterStateKey = "compute-resource"
++)
++
++type preFilterState struct {
++	annoResourceValue string
++	resourceLabels    []string
++}
++
++func (s *preFilterState) Clone() framework.StateData {
++	return s
++}
++
++type ComputeResource struct {
++	handle framework.Handle
++}
++
++var _ framework.FilterPlugin = &ComputeResource{}
++var _ framework.PreFilterPlugin = &ComputeResource{}
++var _ framework.ScorePlugin = &ComputeResource{}
++
++// Name returns name of the plugin. It is used in logs, etc.
++func (pl *ComputeResource) Name() string {
++	return Name
++}
++
++// PreFilter invoked at the prefilter extension point.
++func (pl *ComputeResource) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod) *framework.Status {
++	annoResourceValue, resLabels := eklethelper.GetPrefilterStates(pod.Annotations)
++	preFilterStateValue := preFilterState{
++		annoResourceValue: annoResourceValue,
++		resourceLabels:    resLabels,
++	}
++	cycleState.Write(preFilterStateKey, &preFilterState{
++		annoResourceValue: annoResourceValue,
++		resourceLabels:    resLabels,
++	})
++	klog.V(4).Infof("pod \"%s/%s\" write preFilterStateKey: %#v.", pod.Namespace, pod.Name, preFilterStateValue)
++	return nil
++}
++
++// PreFilterExtensions do not exist for this plugin.
++func (pl *ComputeResource) PreFilterExtensions() framework.PreFilterExtensions {
++	return nil
++}
++
++// Filter invoked at the filter extension point.
++func (pl *ComputeResource) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
++	klog.V(4).Infof("Run filter ComputeResource for pod %s.", pod.Name)
++	node := nodeInfo.Node()
++	if node == nil {
++		return framework.NewStatus(framework.Error, fmt.Sprintf("node not found"))
++	}
++	if !eklethelper.IsEkletNode(node) {
++		// 不是eklet节点，调度器放过
++		return nil
++	}
++	zoneID, _, err := eklethelper.NodeZoneIDAndSubnetID(node)
++	if err != nil {
++		// 不是eklet节点，调度器放过
++		return nil
++	}
++	_, ok := node.Labels[eklethelper.FormatComputeResourceTypeLabel("cpu")]
++	if !ok { // fix report scheduledFailed event when resource-controller doesn't work immediately
++		klog.Infof("pod \"%s/%s\" skip filter on node \"%s\" because no resource labels on node now.", pod.Namespace, pod.Name, node.Name)
++		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("node(%s) didn't have the requested resource labels", node.Name))
++	}
++	klog.V(4).Infof("run filter on eklet node \"%s\".", node.Name)
++	stateObject, err := cycleState.Read(preFilterStateKey)
++	if err != nil {
++		return framework.NewStatus(framework.Error, err.Error())
++	}
++	preFilterStateValue, ok := stateObject.(*preFilterState)
++	if !ok {
++		return framework.NewStatus(framework.Error, fmt.Sprintf("%+v convert to computeResource.preFilterState error", stateObject))
++	}
++	if index := eklethelper.ResourcesSufficientIndex(preFilterStateValue.resourceLabels, node); index >= 0 {
++		klog.V(4).Infof("pod \"%s/%s\" filter node \"%s\" success: resource \"%s\" in zone \"%s\" sufficient. (resLabels: %v)", pod.Namespace, pod.Name, node.Name, preFilterStateValue.resourceLabels[index], zoneID, preFilterStateValue.resourceLabels)
++		return nil
++	} else {
++		klog.V(4).Infof("pod \"%s/%s\" filter node \"%s\" failed: resource \"%v\" in zone \"%s\" insufficient, framework status=UnschedulableAndUnresolvable.", pod.Namespace, pod.Name, node.Name, preFilterStateValue.resourceLabels, zoneID)
++		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("insufficient resources for %s in the %s", preFilterStateValue.annoResourceValue, zoneID))
++	}
++}
++
++func (pl *ComputeResource) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
++	nodeInfo, err := pl.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
++	if err != nil {
++		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
++	}
++	node := nodeInfo.Node()
++	if node == nil {
++		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
++	}
++	if !eklethelper.IsEkletNode(node) {
++		// 不是eklet节点，调度器放过
++		return 0, nil
++	}
++
++	stateObject, err := state.Read(preFilterStateKey)
++	if err != nil {
++		return 0, framework.NewStatus(framework.Error, err.Error())
++	}
++	preFilterStateValue, ok := stateObject.(*preFilterState)
++	if !ok {
++		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("%+v convert to computeResource.preFilterState error", stateObject))
++	}
++	typesLen := len(preFilterStateValue.resourceLabels)
++	if typesLen == 0 || typesLen == 1 {
++		// if no priority
++		klog.V(2).Infof("pod \"%s/%s\" no priority, node \"%s\" score 0 in computeResource score plugin", pod.Namespace, pod.Name, node.Name)
++		return 0, nil
++	}
++
++	klog.V(4).Infof("start to score pod \"%s/%s\" on node \"%s\", resLabels is \"%v\"", pod.Namespace, pod.Name, node.Name, preFilterStateValue.resourceLabels)
++	if index := eklethelper.ResourcesSufficientIndex(preFilterStateValue.resourceLabels, node); index >= 0 {
++		klog.V(2).Infof("node \"%s\" score %d", node.Name, typesLen-index)
++		return int64(typesLen - index), nil
++	}
++	klog.V(2).Infof("node \"%s\" score 0", node.Name)
++	return 0, nil
++}
++
++func (pl *ComputeResource) ScoreExtensions() framework.ScoreExtensions {
++	return nil
++}
++
++// New initializes a new plugin and returns it.
++func New(_ runtime.Object, handle framework.Handle) (framework.Plugin, error) {
++	return &ComputeResource{handle: handle}, nil
++}
+diff --git a/pkg/scheduler/framework/plugins/legacy_registry.go b/pkg/scheduler/framework/plugins/legacy_registry.go
+index 8105b656989..1e499699963 100644
+--- a/pkg/scheduler/framework/plugins/legacy_registry.go
++++ b/pkg/scheduler/framework/plugins/legacy_registry.go
+@@ -25,8 +25,10 @@ import (
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/kubernetes/pkg/features"
+ 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/computeresource"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/imagelocality"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/localreplicas"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodelabel"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodename"
+@@ -80,6 +82,8 @@ const (
+ 	// EvenPodsSpreadPriority defines the name of prioritizer function that prioritizes nodes
+ 	// which have pods and labels matching the incoming pod's topologySpreadConstraints.
+ 	EvenPodsSpreadPriority = "EvenPodsSpreadPriority"
++	// ComputeResourcePriority defines the nodes of prioritizer function ComputeResourcePriority.
++	ComputeResourcePriority = "ComputeResourcePriority"
+ )
+ 
+ const (
+@@ -129,6 +133,10 @@ const (
+ 	NoVolumeZoneConflictPred = "NoVolumeZoneConflict"
+ 	// EvenPodsSpreadPred defines the name of predicate EvenPodsSpread.
+ 	EvenPodsSpreadPred = "EvenPodsSpread"
++	// CheckComputeResourcePred defines the name of predicate CheckComputeResource.
++	CheckComputeResourcePred = "CheckComputeResource"
++	// CheckLocalReplicasPred defines the name of predicate CheckLocalReplicas.
++	CheckLocalReplicasPred = "CheckLocalReplicas"
+ )
+ 
+ // predicateOrdering is the ordering of predicate execution.
+@@ -139,7 +147,7 @@ var predicateOrdering = []string{
+ 	PodToleratesNodeTaintsPred, CheckNodeLabelPresencePred,
+ 	CheckServiceAffinityPred, MaxEBSVolumeCountPred, MaxGCEPDVolumeCountPred, MaxCSIVolumeCountPred,
+ 	MaxAzureDiskVolumeCountPred, MaxCinderVolumeCountPred, CheckVolumeBindingPred, NoVolumeZoneConflictPred,
+-	EvenPodsSpreadPred, MatchInterPodAffinityPred,
++	EvenPodsSpreadPred, MatchInterPodAffinityPred, CheckComputeResourcePred, CheckLocalReplicasPred,
+ }
+ 
+ // LegacyRegistry is used to store current state of registered predicates and priorities.
+@@ -201,6 +209,7 @@ func NewLegacyRegistry() *LegacyRegistry {
+ 			CheckVolumeBindingPred,
+ 			CheckNodeUnschedulablePred,
+ 			EvenPodsSpreadPred,
++			CheckLocalReplicasPred,
+ 		),
+ 
+ 		// Used as the default set of predicates if Policy was specified, but priorities was nil.
+@@ -326,6 +335,10 @@ func NewLegacyRegistry() *LegacyRegistry {
+ 			plugins.PreFilter = appendToPluginSet(plugins.PreFilter, podtopologyspread.Name, nil)
+ 			plugins.Filter = appendToPluginSet(plugins.Filter, podtopologyspread.Name, nil)
+ 		})
++	registry.registerPredicateConfigProducer(CheckLocalReplicasPred,
++		func(_ ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
++			plugins.Filter = appendToPluginSet(plugins.Filter, localreplicas.Name, nil)
++		})
+ 
+ 	// Register Priorities.
+ 	registry.registerPriorityConfigProducer(SelectorSpreadPriority,
+@@ -445,6 +458,22 @@ func NewLegacyRegistry() *LegacyRegistry {
+ 			}
+ 		})
+ 
++	// The following features are used to support eklet node functions.
++	// Prioritizes eklet nodes that satisfy pod's requested resource
++	if feature.DefaultFeatureGate.Enabled(features.EnableComputeResource) {
++		registry.registerPredicateConfigProducer(CheckComputeResourcePred,
++			func(_ ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
++				plugins.PreFilter = appendToPluginSet(plugins.PreFilter, computeresource.Name, nil)
++				plugins.Filter = appendToPluginSet(plugins.Filter, computeresource.Name, nil)
++			})
++		registry.DefaultPredicates.Insert(CheckComputeResourcePred)
++
++		registry.registerPriorityConfigProducer(ComputeResourcePriority,
++			func(args ConfigProducerArgs, plugins *config.Plugins, pluginConfig *[]config.PluginConfig) {
++				plugins.Score = appendToPluginSet(plugins.Score, computeresource.Name, &args.Weight)
++			})
++		registry.DefaultPriorities[ComputeResourcePriority] = 1
++	}
+ 	return registry
+ }
+ 
+diff --git a/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go b/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
+new file mode 100644
+index 00000000000..fcb238ac8d7
+--- /dev/null
++++ b/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
+@@ -0,0 +1,133 @@
++package localreplicas
++
++import (
++	"context"
++	"fmt"
++	"k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	coreinformers "k8s.io/client-go/informers/core/v1"
++	clientset "k8s.io/client-go/kubernetes"
++	"k8s.io/kubernetes/pkg/scheduler/framework"
++	"k8s.io/kubernetes/pkg/scheduler/util"
++	"strconv"
++	"time"
++)
++
++type LocalReplicas struct {
++	handle framework.Handle
++}
++
++var _ framework.FilterPlugin = &LocalReplicas{}
++
++const (
++	// Name is the name of the plugin used in the plugin registry and configurations.
++	Name = "LocalReplicas"
++
++	// ErrReason returned when node name doesn't match.
++	ErrReason = "node(s) didn't match local replicas"
++)
++
++const (
++	autoScaleEKS  = "AUTO_SCALE_EKS"
++	localReplicas = "LOCAL_REPLICAS"
++	kubeSystemNS  = "kube-system"
++	EKSConfigMap  = "eks-config"
++)
++
++// Name returns name of the plugin. It is used in logs, etc.
++func (pl *LocalReplicas) Name() string {
++	return Name
++}
++
++// Filter invoked at the filter extension point.
++func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
++	if nodeInfo.Node() == nil {
++		return framework.NewStatus(framework.Error, "node not found")
++	}
++
++	// no AUTO_SCALE_EKS or AUTO_SCALE_EKS is false, nothing to do
++	if scale := pod.Annotations[autoScaleEKS]; scale != "true" {
++		return nil
++	}
++
++	//process localReplicas
++	localReplicasStr := pod.Annotations[localReplicas]
++	localReplicas, _ := strconv.ParseInt(localReplicasStr, 10, 64)
++	if localReplicas < 0 {
++		localReplicas = 0
++	}
++	if localReplicas == 0 {
++		return filterLocalNode(nodeInfo.Node())
++	}
++
++	//make sure that the previous scheduled pod has nodeName
++	time.Sleep(300 * time.Millisecond)
++
++	podInformer, ok := ctx.Value("podinformer").(coreinformers.PodInformer)
++	if !ok {
++		return framework.NewStatus(framework.Error, "podinformer not found")
++	}
++	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: pod.Labels})
++	if err != nil {
++		return framework.NewStatus(framework.Error, fmt.Sprintf("failed to parse pod labels:%s", err.Error()))
++	}
++	pods, err := podInformer.Lister().List(selector)
++	if err != nil {
++		return framework.NewStatus(framework.Error, fmt.Sprintf("failed to list pods:%s", err.Error()))
++	}
++
++	nodeInformer, ok := ctx.Value("nodeinformer").(coreinformers.NodeInformer)
++	if !ok {
++		return framework.NewStatus(framework.Error, "nodeInformer not found")
++	}
++	var actualLocalReplicas int64
++	for k := range pods {
++		if pods[k].Spec.NodeName != "" && pods[k].OwnerReferences[0].UID == pod.OwnerReferences[0].UID {
++			if node, err := nodeInformer.Lister().Get(pods[k].Spec.NodeName); err != nil {
++				return framework.NewStatus(framework.Error, fmt.Sprintf("node %s not found:%s", pods[k].Spec.NodeName, err.Error()))
++			} else if !util.IsEkletNode(node) {
++				actualLocalReplicas++
++			}
++		}
++	}
++
++	if actualLocalReplicas < localReplicas {
++		if util.HasEKLetToleration(pod) {
++			kubeclient, ok := ctx.Value("kubeclient").(clientset.Interface)
++			if !ok {
++				return framework.NewStatus(framework.Error, "kubeclient not found")
++			}
++			cm, err := kubeclient.CoreV1().ConfigMaps(kubeSystemNS).Get(context.TODO(), EKSConfigMap, metav1.GetOptions{})
++			if err == nil && cm.Data[autoScaleEKS] == "false" {
++				return filterEKSNode(nodeInfo.Node())
++			} else {
++				return nil
++			}
++		}
++	}
++
++	if actualLocalReplicas >= localReplicas {
++		return filterLocalNode(nodeInfo.Node())
++	}
++	return nil
++}
++
++func filterLocalNode(node *v1.Node) *framework.Status {
++	if util.IsEkletNode(node) {
++		return nil
++	}
++	return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason)
++}
++
++func filterEKSNode(node *v1.Node) *framework.Status {
++	if util.IsEkletNode(node) {
++		return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason)
++	}
++	return nil
++}
++
++// New initializes a new plugin and returns it.
++func New(_ runtime.Object, handle framework.Handle) (framework.Plugin, error) {
++	return &LocalReplicas{handle: handle}, nil
++}
+diff --git a/pkg/scheduler/framework/plugins/noderesources/fit.go b/pkg/scheduler/framework/plugins/noderesources/fit.go
+index 8d65cfeefc3..b23873e4596 100644
+--- a/pkg/scheduler/framework/plugins/noderesources/fit.go
++++ b/pkg/scheduler/framework/plugins/noderesources/fit.go
+@@ -27,10 +27,12 @@ import (
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/util/validation/field"
+ 	utilfeature "k8s.io/apiserver/pkg/util/feature"
++	"k8s.io/klog/v2"
+ 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+ 	"k8s.io/kubernetes/pkg/features"
+ 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework"
++	"k8s.io/kubernetes/pkg/scheduler/util"
+ )
+ 
+ var _ framework.PreFilterPlugin = &Fit{}
+@@ -43,6 +45,9 @@ const (
+ 	// preFilterStateKey is the key in CycleState to NodeResourcesFit pre-computed data.
+ 	// Using the name of the plugin will likely help us avoid collisions with other plugins.
+ 	preFilterStateKey = "PreFilter" + FitName
++
++	resourceENIIP     = "tke.cloud.tencent.com/eni-ip"
++	resourceDirectENI = "tke.cloud.tencent.com/direct-eni"
+ )
+ 
+ // Fit is a plugin that checks if a node has sufficient resources.
+@@ -276,6 +281,8 @@ func fitsRequest(podRequest *preFilterState, nodeInfo *framework.NodeInfo, ignor
+ 		})
+ 	}
+ 
++	node := nodeInfo.Node()
++	isEkletNode := util.IsEkletNode(node)
+ 	for rName, rQuant := range podRequest.ScalarResources {
+ 		if v1helper.IsExtendedResourceName(rName) {
+ 			// If this resource is one of the extended resources that should be ignored, we will skip checking it.
+@@ -287,6 +294,11 @@ func fitsRequest(podRequest *preFilterState, nodeInfo *framework.NodeInfo, ignor
+ 			if ignoredExtendedResources.Has(string(rName)) || ignoredResourceGroups.Has(rNamePrefix) {
+ 				continue
+ 			}
++			// If eklet node, ignore eni-ip and direct-eni resource
++			if isEkletNode && (string(rName) == resourceENIIP || string(rName) == resourceDirectENI) {
++				klog.V(4).Infof("skip checking resource name %s on node %s", rName, node.Name)
++				continue
++			}
+ 		}
+ 		if nodeInfo.Allocatable.ScalarResources[rName] < rQuant+nodeInfo.Requested.ScalarResources[rName] {
+ 			insufficientResources = append(insufficientResources, InsufficientResource{
+diff --git a/pkg/scheduler/framework/plugins/registry.go b/pkg/scheduler/framework/plugins/registry.go
+index 5083f55eeb7..38766228b47 100644
+--- a/pkg/scheduler/framework/plugins/registry.go
++++ b/pkg/scheduler/framework/plugins/registry.go
+@@ -17,10 +17,12 @@ limitations under the License.
+ package plugins
+ 
+ import (
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/computeresource"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/imagelocality"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/localreplicas"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodelabel"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodename"
+@@ -73,5 +75,7 @@ func NewInTreeRegistry() runtime.Registry {
+ 		queuesort.Name:                             queuesort.New,
+ 		defaultbinder.Name:                         defaultbinder.New,
+ 		defaultpreemption.Name:                     defaultpreemption.New,
++		computeresource.Name:                       computeresource.New,
++		localreplicas.Name:                         localreplicas.New,
+ 	}
+ }
+diff --git a/pkg/scheduler/util/eklet_helper.go b/pkg/scheduler/util/eklet_helper.go
+new file mode 100644
+index 00000000000..1c129f22041
+--- /dev/null
++++ b/pkg/scheduler/util/eklet_helper.go
+@@ -0,0 +1,114 @@
++package util
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++
++	v1 "k8s.io/api/core/v1"
++)
++
++const (
++	labelResourcePrefix    = "eks.tke.cloud.tencent.com/res-"
++	labelNodeType          = "node.kubernetes.io/instance-type"
++	annotationNodeZoneID   = "eks.tke.cloud.tencent.com/zone-id"
++	annotationNodeSubnetID = "eks.tke.cloud.tencent.com/subnet-id"
++	valueNodeTypeEKLet     = "eklet"
++
++	// annotationCPUType is the annotation key of CPU type.
++	AnnotationCPUType = "eks.tke.cloud.tencent.com/cpu-type" //intel, amd
++	// AnnotationGPUType is the annotation key of GPU type.
++	AnnotationGPUType = "eks.tke.cloud.tencent.com/gpu-type"
++	taintEKLetNodeKey = "eks.tke.cloud.tencent.com/eklet"
++)
++
++var EKLetToleration = &v1.Toleration{
++	Key:      taintEKLetNodeKey,
++	Operator: v1.TolerationOpExists,
++	Effect:   v1.TaintEffectNoSchedule,
++}
++
++func FormatComputeResourceTypeLabel(resourceName string) string {
++	gt := strings.ToLower(resourceName)
++	resourceLabelSuffix := strings.ReplaceAll(gt, "*", "-")
++	resourceLabelSuffix = strings.ReplaceAll(resourceLabelSuffix, "/", "-")
++	return fmt.Sprintf("%s%s", labelResourcePrefix, resourceLabelSuffix)
++}
++
++func IsEkletNode(node *v1.Node) bool {
++	if node == nil {
++		return false
++	}
++	if strings.ToLower(node.Labels[labelNodeType]) == valueNodeTypeEKLet {
++		return true
++	}
++	return false
++}
++
++func HasEKLetToleration(pod *v1.Pod) bool {
++	for i := range pod.Spec.Tolerations {
++		if EKLetToleration.MatchToleration(&pod.Spec.Tolerations[i]) {
++			return true
++		}
++	}
++	return false
++}
++
++func NodeZoneIDAndSubnetID(node *v1.Node) (string, string, error) {
++	zoneID, ok := node.Annotations[annotationNodeZoneID]
++	if !ok || zoneID == "" {
++		return "", "", fmt.Errorf("EKLet node %s have not zoneID", node.Name)
++	}
++
++	subnetID, ok := node.Annotations[annotationNodeSubnetID]
++	if !ok || subnetID == "" {
++		return "", "", fmt.Errorf("EKLet node %s have not subnetID", node.Name)
++	}
++
++	return zoneID, subnetID, nil
++}
++
++func ConvertStrToResourceLabels(isGPU bool, typeStr string) []string {
++	types := strings.Split(typeStr, ",")
++	typesLen := len(types)
++	results := make([]string, 0, typesLen)
++	hasCPU := false
++	for i := 0; i < typesLen; i++ {
++		if types[i] == "cpu" {
++			hasCPU = true
++		}
++		results = append(results, FormatComputeResourceTypeLabel(types[i]))
++	}
++	// allow "res-cpu" unless assign intel/amd
++	if !isGPU && strings.ToLower(typeStr) != "intel" && strings.ToLower(typeStr) != "amd" && !hasCPU {
++		results = append(results, FormatComputeResourceTypeLabel("cpu"))
++	}
++	return results
++}
++
++func GetPrefilterStates(annotations map[string]string) (string, []string) {
++	var ok bool
++	var resLabels []string
++	gpuType, ok := annotations[AnnotationGPUType]
++	if ok && gpuType != "" {
++		resLabels = ConvertStrToResourceLabels(true, gpuType)
++		return gpuType, resLabels
++	}
++	cpuType, ok := annotations[AnnotationCPUType]
++	if ok && cpuType != "" {
++		resLabels = ConvertStrToResourceLabels(false, cpuType)
++		return cpuType, resLabels
++	}
++	resLabels = ConvertStrToResourceLabels(false, "cpu")
++	return "cpu", resLabels
++}
++
++func ResourcesSufficientIndex(resLabels []string, node *v1.Node) int {
++	for index, resLabel := range resLabels {
++		sufficient, exists := node.Labels[resLabel]
++		if exists && sufficient == strconv.FormatBool(true) {
++			return index
++		}
++	}
++	return -1
++}

@@ -1,0 +1,22 @@
+diff --git a/pkg/proxy/ipvs/proxier.go b/pkg/proxy/ipvs/proxier.go
+index 7d67008332c..0777e328e8f 100644
+--- a/pkg/proxy/ipvs/proxier.go
++++ b/pkg/proxy/ipvs/proxier.go
+@@ -1318,7 +1318,7 @@ func (proxier *Proxier) syncProxyRules() {
+ 				serv.Flags |= utilipvs.FlagPersistent
+ 				serv.Timeout = uint32(svcInfo.StickyMaxAgeSeconds())
+ 			}
+-			if err := proxier.syncService(svcNameString, serv, true, bindedAddresses); err == nil {
++			if err := proxier.syncService(svcNameString, serv, false, bindedAddresses); err == nil {
+ 				activeIPVSServices[serv.String()] = true
+ 				activeBindAddrs[serv.Address.String()] = true
+ 
+@@ -1421,7 +1421,7 @@ func (proxier *Proxier) syncProxyRules() {
+ 					serv.Flags |= utilipvs.FlagPersistent
+ 					serv.Timeout = uint32(svcInfo.StickyMaxAgeSeconds())
+ 				}
+-				if err := proxier.syncService(svcNameString, serv, true, bindedAddresses); err == nil {
++				if err := proxier.syncService(svcNameString, serv, false, bindedAddresses); err == nil {
+ 					activeIPVSServices[serv.String()] = true
+ 					activeBindAddrs[serv.Address.String()] = true
+ 					if err := proxier.syncEndpoint(svcName, svcInfo.OnlyNodeLocalEndpoints(), serv); err != nil {

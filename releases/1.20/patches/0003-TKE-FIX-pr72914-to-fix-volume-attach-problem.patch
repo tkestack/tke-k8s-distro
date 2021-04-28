@@ -1,0 +1,47 @@
+diff --git a/pkg/controller/volume/attachdetach/reconciler/BUILD b/pkg/controller/volume/attachdetach/reconciler/BUILD
+index d4b56ba2cc3..934caea9492 100644
+--- a/pkg/controller/volume/attachdetach/reconciler/BUILD
++++ b/pkg/controller/volume/attachdetach/reconciler/BUILD
+@@ -17,6 +17,7 @@ go_library(
+         "//pkg/kubelet/events:go_default_library",
+         "//pkg/util/goroutinemap/exponentialbackoff:go_default_library",
+         "//pkg/volume/util:go_default_library",
++        "//pkg/volume/util/nestedpendingoperations:go_default_library",
+         "//pkg/volume/util/operationexecutor:go_default_library",
+         "//staging/src/k8s.io/api/core/v1:go_default_library",
+         "//staging/src/k8s.io/apimachinery/pkg/types:go_default_library",
+diff --git a/pkg/controller/volume/attachdetach/reconciler/reconciler.go b/pkg/controller/volume/attachdetach/reconciler/reconciler.go
+index 247b49ca640..a63edabf9a1 100644
+--- a/pkg/controller/volume/attachdetach/reconciler/reconciler.go
++++ b/pkg/controller/volume/attachdetach/reconciler/reconciler.go
+@@ -35,6 +35,7 @@ import (
+ 	kevents "k8s.io/kubernetes/pkg/kubelet/events"
+ 	"k8s.io/kubernetes/pkg/util/goroutinemap/exponentialbackoff"
+ 	"k8s.io/kubernetes/pkg/volume/util"
++	"k8s.io/kubernetes/pkg/volume/util/nestedpendingoperations"
+ 	"k8s.io/kubernetes/pkg/volume/util/operationexecutor"
+ )
+ 
+@@ -221,11 +222,17 @@ func (rc *reconciler) reconcile() {
+ 					metrics.RecordForcedDetachMetric()
+ 					klog.Warningf(attachedVolume.GenerateMsgDetailed("attacherDetacher.DetachVolume started", fmt.Sprintf("This volume is not safe to detach, but maxWaitForUnmountDuration %v expired, force detaching", rc.maxWaitForUnmountDuration)))
+ 				}
+-			}
+-			if err != nil && !exponentialbackoff.IsExponentialBackoff(err) {
+-				// Ignore exponentialbackoff.IsExponentialBackoff errors, they are expected.
+-				// Log all other errors.
+-				klog.Errorf(attachedVolume.GenerateErrorDetailed("attacherDetacher.DetachVolume failed to start", err).Error())
++			} else {
++				if !nestedpendingoperations.IsAlreadyExists(err) {
++					// add volume back to ReportAsAttached list
++					klog.Infof("Error %v happened on node %s, should add %s back to attached list", err, attachedVolume.AttachedVolume.NodeName, attachedVolume.AttachedVolume.VolumeName)
++					rc.actualStateOfWorld.AddVolumeToReportAsAttached(attachedVolume.VolumeName, attachedVolume.NodeName)
++				}
++				if !exponentialbackoff.IsExponentialBackoff(err) {
++					// Ignore exponentialbackoff.IsExponentialBackoff errors, they are expected.
++					// Log all other errors.
++					klog.Errorf(attachedVolume.GenerateErrorDetailed("attacherDetacher.DetachVolume failed to start", err).Error())
++				}
+ 			}
+ 		}
+ 	}

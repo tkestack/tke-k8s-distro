@@ -1,0 +1,25 @@
+diff --git a/pkg/kubelet/server/server.go b/pkg/kubelet/server/server.go
+index 2b033e2ca6f..a8f74f5a606 100644
+--- a/pkg/kubelet/server/server.go
++++ b/pkg/kubelet/server/server.go
+@@ -966,6 +966,8 @@ func containerPrometheusLabelsFunc(s stats.Provider) metrics.ContainerLabelsFunc
+ 		}
+ 		if v, ok := c.Spec.Labels[kubelettypes.KubernetesContainerNameLabel]; ok {
+ 			containerName = v
++		} else if v, ok := c.Spec.Labels[kubelettypes.ContainerdKindLabel]; ok {
++			containerName = v
+ 		}
+ 		// Associate pod cgroup with pod so we have an accurate accounting of sandbox
+ 		if podName == "" && namespace == "" {
+diff --git a/pkg/kubelet/types/labels.go b/pkg/kubelet/types/labels.go
+index c4dad6302e5..fe1a89eadea 100644
+--- a/pkg/kubelet/types/labels.go
++++ b/pkg/kubelet/types/labels.go
+@@ -21,6 +21,7 @@ const (
+ 	KubernetesPodNamespaceLabel  = "io.kubernetes.pod.namespace"
+ 	KubernetesPodUIDLabel        = "io.kubernetes.pod.uid"
+ 	KubernetesContainerNameLabel = "io.kubernetes.container.name"
++	ContainerdKindLabel          = "io.cri-containerd.kind"
+ )
+ 
+ func GetContainerName(labels map[string]string) string {

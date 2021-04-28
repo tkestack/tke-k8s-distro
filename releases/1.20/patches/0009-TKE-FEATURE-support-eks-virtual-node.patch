@@ -1,0 +1,316 @@
+diff --git a/pkg/controller/daemon/daemon_controller.go b/pkg/controller/daemon/daemon_controller.go
+index a0fc135156e..3fcc7e51eba 100644
+--- a/pkg/controller/daemon/daemon_controller.go
++++ b/pkg/controller/daemon/daemon_controller.go
+@@ -53,6 +53,7 @@ import (
+ 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+ 	"k8s.io/kubernetes/pkg/controller"
+ 	"k8s.io/kubernetes/pkg/controller/daemon/util"
++	nodeutil "k8s.io/kubernetes/pkg/controller/util/node"
+ 	pluginhelper "k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
+ 	"k8s.io/utils/integer"
+ )
+@@ -1230,6 +1231,12 @@ func (dsc *DaemonSetsController) nodeShouldRunDaemonPod(node *v1.Node, ds *apps.
+ 		return false, false, nil
+ 	}
+ 
++	// Do not run daemonet pods on virtual nodes
++	if nodeutil.IsVirtualKubelet(node) {
++		klog.V(4).Infof("do not run pods for daemonset %s/%s on virtual node %s", ds.Namespace, ds.Name, node.Name)
++		return false, false, nil
++	}
++
+ 	taints := node.Spec.Taints
+ 	fitsNodeName, fitsNodeAffinity, fitsTaints := Predicates(pod, node, taints)
+ 	if !fitsNodeName || !fitsNodeAffinity {
+diff --git a/pkg/controller/nodeipam/ipam/range_allocator.go b/pkg/controller/nodeipam/ipam/range_allocator.go
+index 695c19c4c49..f5704a6882d 100644
+--- a/pkg/controller/nodeipam/ipam/range_allocator.go
++++ b/pkg/controller/nodeipam/ipam/range_allocator.go
+@@ -21,9 +21,9 @@ import (
+ 	"net"
+ 	"sync"
+ 
+-	"k8s.io/api/core/v1"
+ 	"k8s.io/klog/v2"
+ 
++	v1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+@@ -118,6 +118,12 @@ func NewCIDRRangeAllocator(client clientset.Interface, nodeInformer informers.No
+ 
+ 	if nodeList != nil {
+ 		for _, node := range nodeList.Items {
++			// Do not allocate PodCIDR for virtual nodes
++			if nodeutil.IsVirtualKubelet(&node) {
++				klog.V(4).Infof("No need to process virtual node %s", node.Name)
++				continue
++			}
++
+ 			if len(node.Spec.PodCIDRs) == 0 {
+ 				klog.V(4).Infof("Node %v has no CIDR, ignoring", node.Name)
+ 				continue
+@@ -135,7 +141,17 @@ func NewCIDRRangeAllocator(client clientset.Interface, nodeInformer informers.No
+ 
+ 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+ 		AddFunc: nodeutil.CreateAddNodeHandler(ra.AllocateOrOccupyCIDR),
+-		UpdateFunc: nodeutil.CreateUpdateNodeHandler(func(_, newNode *v1.Node) error {
++		UpdateFunc: nodeutil.CreateUpdateNodeHandler(func(oldNode, newNode *v1.Node) error {
++			// Node should not be changed from virtual to non-virtual, neither vice-versa
++			if nodeutil.IsVirtualKubelet(oldNode) != nodeutil.IsVirtualKubelet(newNode) {
++				return fmt.Errorf("Node %s should not be changed from virtual to non-virtual, neither vice-versa", newNode.Name)
++			}
++
++			// Do not allocate PodCIDR for virtual nodes
++			if nodeutil.IsVirtualKubelet(newNode) {
++				klog.V(4).Infof("No need to allocate PodCIDR for virtual node %s", newNode.Name)
++				return nil
++			}
+ 			// If the PodCIDRs list is not empty we either:
+ 			// - already processed a Node that already had CIDRs after NC restarted
+ 			//   (cidr is marked as used),
+@@ -249,6 +265,13 @@ func (r *rangeAllocator) AllocateOrOccupyCIDR(node *v1.Node) error {
+ 	if node == nil {
+ 		return nil
+ 	}
++
++	// Do not allocate PodCIDR for virtual nodes
++	if nodeutil.IsVirtualKubelet(node) {
++		klog.V(4).Infof("No need to allocate PodCIDR for virtual node %s", node.Name)
++		return nil
++	}
++
+ 	if !r.insertNodeToProcessing(node.Name) {
+ 		klog.V(2).Infof("Node %v is already in a process of CIDR assignment.", node.Name)
+ 		return nil
+diff --git a/pkg/controller/nodelifecycle/node_lifecycle_controller.go b/pkg/controller/nodelifecycle/node_lifecycle_controller.go
+index 4f7fe5e1c66..13de07183f7 100644
+--- a/pkg/controller/nodelifecycle/node_lifecycle_controller.go
++++ b/pkg/controller/nodelifecycle/node_lifecycle_controller.go
+@@ -843,10 +843,12 @@ func (nc *Controller) monitorNodeHealth() error {
+ 				nodeutil.RecordNodeStatusChange(nc.recorder, node, "NodeNotReady")
+ 				fallthrough
+ 			case needsRetry && observedReadyCondition.Status != v1.ConditionTrue:
+-				if err = nodeutil.MarkPodsNotReady(nc.kubeClient, nc.recorder, pods, node.Name); err != nil {
+-					utilruntime.HandleError(fmt.Errorf("unable to mark all pods NotReady on node %v: %v; queuing for retry", node.Name, err))
+-					nc.nodesToRetry.Store(node.Name, struct{}{})
+-					continue
++				if !nodeutil.IsVirtualKubelet(node) {
++					if err = nodeutil.MarkPodsNotReady(nc.kubeClient, nc.recorder, pods, node.Name); err != nil {
++						utilruntime.HandleError(fmt.Errorf("unable to mark all pods NotReady on node %v: %v; queuing for retry", node.Name, err))
++						nc.nodesToRetry.Store(node.Name, struct{}{})
++						continue
++					}
+ 				}
+ 			}
+ 		}
+@@ -862,6 +864,10 @@ func (nc *Controller) processTaintBaseEviction(node *v1.Node, observedReadyCondi
+ 	// Check eviction timeout against decisionTimestamp
+ 	switch observedReadyCondition.Status {
+ 	case v1.ConditionFalse:
++		// Only do eviction processing for real nodes
++		if nodeutil.IsVirtualKubelet(node) {
++			break
++		}
+ 		// We want to update the taint straight away if Node is already tainted with the UnreachableTaint
+ 		if taintutils.TaintExists(node.Spec.Taints, UnreachableTaintTemplate) {
+ 			taintToAdd := *NotReadyTaintTemplate
+@@ -875,6 +881,10 @@ func (nc *Controller) processTaintBaseEviction(node *v1.Node, observedReadyCondi
+ 			)
+ 		}
+ 	case v1.ConditionUnknown:
++		// Only do eviction processing for real nodes
++		if nodeutil.IsVirtualKubelet(node) {
++			break
++		}
+ 		// We want to update the taint straight away if Node is already tainted with the UnreachableTaint
+ 		if taintutils.TaintExists(node.Spec.Taints, NotReadyTaintTemplate) {
+ 			taintToAdd := *UnreachableTaintTemplate
+@@ -907,6 +917,10 @@ func (nc *Controller) processNoTaintBaseEviction(node *v1.Node, observedReadyCon
+ 	// Check eviction timeout against decisionTimestamp
+ 	switch observedReadyCondition.Status {
+ 	case v1.ConditionFalse:
++		// Only do eviction processing for real nodes
++		if nodeutil.IsVirtualKubelet(node) {
++			break
++		}
+ 		if decisionTimestamp.After(nodeHealthData.readyTransitionTimestamp.Add(nc.podEvictionTimeout)) {
+ 			enqueued, err := nc.evictPods(node, pods)
+ 			if err != nil {
+@@ -922,6 +936,10 @@ func (nc *Controller) processNoTaintBaseEviction(node *v1.Node, observedReadyCon
+ 			}
+ 		}
+ 	case v1.ConditionUnknown:
++		// Only do eviction processing for real nodes
++		if nodeutil.IsVirtualKubelet(node) {
++			break
++		}
+ 		if decisionTimestamp.After(nodeHealthData.probeTimestamp.Add(nc.podEvictionTimeout)) {
+ 			enqueued, err := nc.evictPods(node, pods)
+ 			if err != nil {
+diff --git a/pkg/controller/replicaset/replica_set.go b/pkg/controller/replicaset/replica_set.go
+index f52eab6ca92..849849a6f4e 100644
+--- a/pkg/controller/replicaset/replica_set.go
++++ b/pkg/controller/replicaset/replica_set.go
+@@ -37,7 +37,7 @@ import (
+ 	"time"
+ 
+ 	apps "k8s.io/api/apps/v1"
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -70,6 +70,10 @@ const (
+ 
+ 	// The number of times we retry updating a ReplicaSet's status.
+ 	statusUpdateRetries = 1
++
++	// The annotation indicating that the pod is running on virtual kubelet
++	virtualKubeletPodAnnotation      = "tke.cloud.tencent.com/pod-type"
++	virtualKubeletPodAnnotationValue = "eklet"
+ )
+ 
+ // ReplicaSetController is responsible for synchronizing ReplicaSet objects stored
+@@ -804,6 +808,7 @@ func getPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
+ 		podsWithRanks := getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
+ 		sort.Sort(podsWithRanks)
+ 	}
++
+ 	return filteredPods[:diff]
+ }
+ 
+@@ -819,12 +824,29 @@ func getPodsRankedByRelatedPodsOnSameNode(podsToRank, relatedPods []*v1.Pod) con
+ 		}
+ 	}
+ 	ranks := make([]int, len(podsToRank))
++	vkPodRankAddition := len(relatedPods)
+ 	for i, pod := range podsToRank {
+-		ranks[i] = podsOnNode[pod.Spec.NodeName]
++		// Set a larger rank for pods on virtual node than other pods so that these pods would be deleted first
++		if isVirtualKubeletPod(pod) {
++			klog.V(4).Infof("Pod %s is running on virtual kubelet", pod.Name)
++			ranks[i] = podsOnNode[pod.Spec.NodeName] + vkPodRankAddition
++		} else {
++			ranks[i] = podsOnNode[pod.Spec.NodeName]
++		}
++		klog.V(4).Infof("Rank for pod %s is %d", pod.Name, ranks[i])
+ 	}
+ 	return controller.ActivePodsWithRanks{Pods: podsToRank, Rank: ranks}
+ }
+ 
++func isVirtualKubeletPod(pod *v1.Pod) bool {
++	v, ok := pod.Annotations[virtualKubeletPodAnnotation]
++	if !ok {
++		return false
++	}
++
++	return v == virtualKubeletPodAnnotationValue
++}
++
+ func getPodKeys(pods []*v1.Pod) []string {
+ 	podKeys := make([]string, 0, len(pods))
+ 	for _, pod := range pods {
+diff --git a/pkg/controller/util/node/controller_utils.go b/pkg/controller/util/node/controller_utils.go
+index 4f941c1ad41..041b72585c4 100644
+--- a/pkg/controller/util/node/controller_utils.go
++++ b/pkg/controller/util/node/controller_utils.go
+@@ -29,7 +29,7 @@ import (
+ 	"k8s.io/client-go/tools/cache"
+ 	"k8s.io/client-go/tools/record"
+ 
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	clientset "k8s.io/client-go/kubernetes"
+ 	appsv1listers "k8s.io/client-go/listers/apps/v1"
+ 	utilpod "k8s.io/kubernetes/pkg/api/v1/pod"
+@@ -40,6 +40,13 @@ import (
+ 	"k8s.io/klog/v2"
+ )
+ 
++const (
++	// Label ant value to identify virtual kubelet node
++	virtualKubeletLabelBeta  = "beta.kubernetes.io/instance-type"
++	virtualKubeletLabel      = "node.kubernetes.io/instance-type"
++	virtualKubeletLabelValue = "eklet"
++)
++
+ // DeletePods will delete all pods from master running on given node,
+ // and return true if any pods were deleted, or were found pending
+ // deletion.
+@@ -300,3 +307,28 @@ func GetNodeCondition(status *v1.NodeStatus, conditionType v1.NodeConditionType)
+ 	}
+ 	return -1, nil
+ }
++
++// IsVirtualKubelet checks whether a node is virtual, based on the "instance-type" label
++// Return true if the value of instance-type label equals to "eklet"
++func IsVirtualKubelet(node *v1.Node) bool {
++	if node == nil {
++		return false
++	}
++	nodeLabels := node.Labels
++
++	if nodeLabels == nil {
++		return false
++	}
++
++	v, ok := nodeLabels[virtualKubeletLabelBeta]
++	if ok && v == virtualKubeletLabelValue {
++		return true
++	}
++
++	v, ok = nodeLabels[virtualKubeletLabel]
++	if !ok {
++		return false
++	}
++
++	return v == virtualKubeletLabelValue
++}
+diff --git a/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go b/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go
+index 6f934223144..89e1883ddbc 100644
+--- a/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go
++++ b/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go
+@@ -25,7 +25,7 @@ import (
+ 
+ 	"k8s.io/klog/v2"
+ 
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/types"
+@@ -42,6 +42,7 @@ import (
+ 	cloudprovider "k8s.io/cloud-provider"
+ 	cloudnodeutil "k8s.io/cloud-provider/node/helpers"
+ 	"k8s.io/component-base/metrics/prometheus/ratelimiter"
++	nodeutil "k8s.io/kubernetes/pkg/controller/util/node"
+ )
+ 
+ const (
+@@ -155,6 +156,12 @@ func (rc *RouteController) reconcile(nodes []*v1.Node, routes []*cloudprovider.R
+ 		if len(node.Spec.PodCIDRs) == 0 {
+ 			continue
+ 		}
++
++		// Skip virtual nodes
++		if nodeutil.IsVirtualKubelet(node) {
++			continue
++		}
++
+ 		nodeName := types.NodeName(node.Name)
+ 		l.Lock()
+ 		nodeRoutesStatuses[nodeName] = make(map[string]bool)
+@@ -259,6 +266,11 @@ func (rc *RouteController) reconcile(nodes []*v1.Node, routes []*cloudprovider.R
+ 	// after all routes have been created (or not), we start updating
+ 	// all nodes' statuses with the outcome
+ 	for _, node := range nodes {
++		// Skip virtual nodes
++		if nodeutil.IsVirtualKubelet(node) {
++			continue
++		}
++
+ 		wg.Add(1)
+ 		nodeRoutes := nodeRoutesStatuses[types.NodeName(node.Name)]
+ 		allRoutesCreated := true

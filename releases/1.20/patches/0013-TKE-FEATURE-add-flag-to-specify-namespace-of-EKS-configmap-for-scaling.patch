@@ -1,0 +1,68 @@
+diff --git a/cmd/kube-scheduler/app/options/options.go b/cmd/kube-scheduler/app/options/options.go
+index b4d45071bd5..d17a0bb877d 100644
+--- a/cmd/kube-scheduler/app/options/options.go
++++ b/cmd/kube-scheduler/app/options/options.go
+@@ -71,6 +71,8 @@ type Options struct {
+ 	WriteConfigTo string
+ 
+ 	Master string
++
++	ScaleEKSConfNamespace string
+ }
+ 
+ // NewOptions returns default scheduler app options.
+@@ -157,6 +159,7 @@ func (o *Options) Flags() (nfs cliflag.NamedFlagSets) {
+   --policy-configmap-namespace`)
+ 	fs.StringVar(&o.WriteConfigTo, "write-config-to", o.WriteConfigTo, "If set, write the configuration values to this file and exit.")
+ 	fs.StringVar(&o.Master, "master", o.Master, "The address of the Kubernetes API server (overrides any value in kubeconfig)")
++	fs.StringVar(&o.ScaleEKSConfNamespace, "eks-config-namespace", o.ScaleEKSConfNamespace, "The namespace of scale eks configmap")
+ 
+ 	o.SecureServing.AddFlags(nfs.FlagSet("secure serving"))
+ 	o.CombinedInsecureServing.AddFlags(nfs.FlagSet("insecure serving"))
+diff --git a/cmd/kube-scheduler/app/server.go b/cmd/kube-scheduler/app/server.go
+index dbca16f9d4e..c729e65cb06 100644
+--- a/cmd/kube-scheduler/app/server.go
++++ b/cmd/kube-scheduler/app/server.go
+@@ -128,6 +128,7 @@ func runCommand(cmd *cobra.Command, opts *options.Options, registryOptions ...Op
+ 	if err != nil {
+ 		return err
+ 	}
++	ctx = context.WithValue(ctx, "scaleEKSconfns", opts.ScaleEKSConfNamespace)
+ 
+ 	return Run(ctx, cc, sched)
+ }
+diff --git a/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go b/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
+index fcb238ac8d7..d9304639f58 100644
+--- a/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
++++ b/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
+@@ -82,10 +82,10 @@ func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, po
+ 		return framework.NewStatus(framework.Error, "nodeInformer not found")
+ 	}
+ 	var actualLocalReplicas int64
+-	for k := range pods {
+-		if pods[k].Spec.NodeName != "" && pods[k].OwnerReferences[0].UID == pod.OwnerReferences[0].UID {
+-			if node, err := nodeInformer.Lister().Get(pods[k].Spec.NodeName); err != nil {
+-				return framework.NewStatus(framework.Error, fmt.Sprintf("node %s not found:%s", pods[k].Spec.NodeName, err.Error()))
++	for _, v := range pods {
++		if v.Spec.NodeName != "" && len(v.OwnerReferences) != 0 && len(pod.OwnerReferences) != 0 && v.OwnerReferences[0].UID == pod.OwnerReferences[0].UID {
++			if node, err := nodeInformer.Lister().Get(v.Spec.NodeName); err != nil {
++				return framework.NewStatus(framework.Error, fmt.Sprintf("node %s not found:%s", v.Spec.NodeName, err.Error()))
+ 			} else if !util.IsEkletNode(node) {
+ 				actualLocalReplicas++
+ 			}
+@@ -98,7 +98,14 @@ func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, po
+ 			if !ok {
+ 				return framework.NewStatus(framework.Error, "kubeclient not found")
+ 			}
+-			cm, err := kubeclient.CoreV1().ConfigMaps(kubeSystemNS).Get(context.TODO(), EKSConfigMap, metav1.GetOptions{})
++			scaleEKSConfNS, ok := ctx.Value("scaleEKSconfns").(string)
++			if !ok {
++				return framework.NewStatus(framework.Error, "scaleEKSconfns not found")
++			}
++			if scaleEKSConfNS == "" {
++				scaleEKSConfNS = kubeSystemNS
++			}
++			cm, err := kubeclient.CoreV1().ConfigMaps(scaleEKSConfNS).Get(context.TODO(), EKSConfigMap, metav1.GetOptions{})
+ 			if err == nil && cm.Data[autoScaleEKS] == "false" {
+ 				return filterEKSNode(nodeInfo.Node())
+ 			} else {

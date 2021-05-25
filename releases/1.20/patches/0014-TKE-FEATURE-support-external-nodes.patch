@@ -1,0 +1,138 @@
+diff --git a/pkg/controller/nodeipam/ipam/range_allocator.go b/pkg/controller/nodeipam/ipam/range_allocator.go
+index f5704a6882d..ef0a335b02e 100644
+--- a/pkg/controller/nodeipam/ipam/range_allocator.go
++++ b/pkg/controller/nodeipam/ipam/range_allocator.go
+@@ -124,6 +124,12 @@ func NewCIDRRangeAllocator(client clientset.Interface, nodeInformer informers.No
+ 				continue
+ 			}
+ 
++			// Do not allocate PodCIDR for external nodes
++			if nodeutil.IsExternalKubelet(&node) {
++				klog.V(4).Infof("No need to process external node %s", node.Name)
++				continue
++			}
++
+ 			if len(node.Spec.PodCIDRs) == 0 {
+ 				klog.V(4).Infof("Node %v has no CIDR, ignoring", node.Name)
+ 				continue
+@@ -152,6 +158,17 @@ func NewCIDRRangeAllocator(client clientset.Interface, nodeInformer informers.No
+ 				klog.V(4).Infof("No need to allocate PodCIDR for virtual node %s", newNode.Name)
+ 				return nil
+ 			}
++
++			// Node should not be changed from external to non-external, neither vice-versa
++			if nodeutil.IsExternalKubelet(oldNode) != nodeutil.IsExternalKubelet(newNode) {
++				return fmt.Errorf("Node %s should not be changed from external to non-external, neither vice-versa", newNode.Name)
++			}
++
++			// Do not allocate PodCIDR for external nodes
++			if nodeutil.IsExternalKubelet(newNode) {
++				klog.V(4).Infof("No need to allocate PodCIDR for external node %s", newNode.Name)
++				return nil
++			}
+ 			// If the PodCIDRs list is not empty we either:
+ 			// - already processed a Node that already had CIDRs after NC restarted
+ 			//   (cidr is marked as used),
+@@ -272,6 +289,12 @@ func (r *rangeAllocator) AllocateOrOccupyCIDR(node *v1.Node) error {
+ 		return nil
+ 	}
+ 
++	// Do not allocate PodCIDR for external nodes
++	if nodeutil.IsExternalKubelet(node) {
++		klog.V(4).Infof("No need to allocate PodCIDR for external node %s", node.Name)
++		return nil
++	}
++
+ 	if !r.insertNodeToProcessing(node.Name) {
+ 		klog.V(2).Infof("Node %v is already in a process of CIDR assignment.", node.Name)
+ 		return nil
+diff --git a/pkg/controller/util/node/controller_utils.go b/pkg/controller/util/node/controller_utils.go
+index 041b72585c4..7c14dba36fd 100644
+--- a/pkg/controller/util/node/controller_utils.go
++++ b/pkg/controller/util/node/controller_utils.go
+@@ -41,10 +41,10 @@ import (
+ )
+ 
+ const (
+-	// Label ant value to identify virtual kubelet node
+-	virtualKubeletLabelBeta  = "beta.kubernetes.io/instance-type"
+-	virtualKubeletLabel      = "node.kubernetes.io/instance-type"
+-	virtualKubeletLabelValue = "eklet"
++	// EKS virutal node
++	InstanceTypeVirtual = "eklet"
++	// External IDC node
++	InstanceTypeExternal = "external"
+ )
+ 
+ // DeletePods will delete all pods from master running on given node,
+@@ -320,15 +320,40 @@ func IsVirtualKubelet(node *v1.Node) bool {
+ 		return false
+ 	}
+ 
+-	v, ok := nodeLabels[virtualKubeletLabelBeta]
+-	if ok && v == virtualKubeletLabelValue {
++	v, ok := nodeLabels[v1.LabelInstanceType]
++	if ok && v == InstanceTypeVirtual {
+ 		return true
+ 	}
+ 
+-	v, ok = nodeLabels[virtualKubeletLabel]
++	v, ok = nodeLabels[v1.LabelInstanceTypeStable]
+ 	if !ok {
+ 		return false
+ 	}
+ 
+-	return v == virtualKubeletLabelValue
++	return v == InstanceTypeVirtual
++}
++
++// IsExternalKubelet checks whether a node is external running in IDC, based on the "instance-type" label
++// Return true if the value of instance-type label equals to "external"
++func IsExternalKubelet(node *v1.Node) bool {
++	if node == nil {
++		return false
++	}
++	nodeLabels := node.Labels
++
++	if nodeLabels == nil {
++		return false
++	}
++
++	v, ok := nodeLabels[v1.LabelInstanceType]
++	if ok && v == InstanceTypeExternal {
++		return true
++	}
++
++	v, ok = nodeLabels[v1.LabelInstanceTypeStable]
++	if !ok {
++		return false
++	}
++
++	return v == InstanceTypeExternal
+ }
+diff --git a/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go b/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go
+index 89e1883ddbc..f3b2ad346da 100644
+--- a/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go
++++ b/staging/src/k8s.io/cloud-provider/controllers/route/route_controller.go
+@@ -157,8 +157,8 @@ func (rc *RouteController) reconcile(nodes []*v1.Node, routes []*cloudprovider.R
+ 			continue
+ 		}
+ 
+-		// Skip virtual nodes
+-		if nodeutil.IsVirtualKubelet(node) {
++		// Skip virtual/external nodes
++		if nodeutil.IsVirtualKubelet(node) || nodeutil.IsExternalKubelet(node) {
+ 			continue
+ 		}
+ 
+@@ -266,8 +266,8 @@ func (rc *RouteController) reconcile(nodes []*v1.Node, routes []*cloudprovider.R
+ 	// after all routes have been created (or not), we start updating
+ 	// all nodes' statuses with the outcome
+ 	for _, node := range nodes {
+-		// Skip virtual nodes
+-		if nodeutil.IsVirtualKubelet(node) {
++		// Skip virtual/external nodes
++		if nodeutil.IsVirtualKubelet(node) || nodeutil.IsExternalKubelet(node) {
+ 			continue
+ 		}
+ 

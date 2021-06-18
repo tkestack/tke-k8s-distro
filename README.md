@@ -1,25 +1,19 @@
-# Tencent TKE Kubernetes Distribution
+# TKE Kubernetes Distro
 
-Tencent **tke-k8s-distro** is the kubernetes distribution used by TencentCloud
-[TKE](https://cloud.tencent.com/product/tke) product. 
-This distro is based on the community [kubernetes](https://github.com/kubernetes/kubernetes),
-and includes additional fetaures and fixes.
-
-With this repository, you can build the same versions of k8s components as used in TencentCloud TKE.
+**Tencent TKE Kubernetes Distro(tke-k8s-distro)** is a kubernetes distribution used by Tencent Kubernetes Engine(TKE) to create secure and reliable Kubernetes clusters. Users can rely on tke-k8s-distro to run Kubernetes services that are exactly the same as TKE on self-built or hosted IDC, physical machines or virtual machines. tke-k8s-distro clusters can be seamlessly integrated with TKE to buiild hybrid cloud. Users can extend worloads in private IDC to TKE through tke-k8s-distro clusters, and take advantage of the flexibility of TKE, EKS and other Tencent cloud services.
 
 ## Releases
-Following release are supported.
-
-| Release | TKE Version |Base K8s Version | Go version |
+| Release | TKE Version | Kubernetes Version | Go version |
 | --- | --- | --- | --- |
-| 1.20 | v1.20.6-tke.1| v1.20.6 | go 1.15.11+ |
+| 1.20 | v1.20.6-tke.1 | v1.20.6 | go 1.15.11+ |
 
-## Build Binaries
-
+## How to build
 `make RELEASE=1.20` 
-
 or 
-
 `make` which will build the latest relase.
 
 The binaries will be placed at `_output/<release>/` directory, and include `kubeadm, kube-apiserver, kube-controller-manager, kubectl, kubelet, kube-proxy, kube-scheduler`
+
+## License
+
+This project is licensed under the [Apache-2.0 License](LICENSE).

@@ -6,9 +6,10 @@
 | Release | TKE Version | Kubernetes Version | Go version |
 | --- | --- | --- | --- |
 | 1.20 | v1.20.6-tke.1 | v1.20.6 | go 1.15.11+ |
+| 1.21 | v1.21.4-tke.1 | v1.21.4 | go 1.16.7+ |
 
 ## How to build
-`make RELEASE=1.20` 
+`make RELEASE=1.21` 
 or 
 `make` which will build the latest relase.
 

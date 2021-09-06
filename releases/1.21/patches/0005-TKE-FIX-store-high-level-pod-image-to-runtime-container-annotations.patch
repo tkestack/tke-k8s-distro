@@ -1,0 +1,81 @@
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container.go b/pkg/kubelet/kuberuntime/kuberuntime_container.go
+index 3804e9b04a5..f1b617e3ae6 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_container.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container.go
+@@ -506,6 +506,9 @@ func toKubeContainerStatus(status *runtimeapi.ContainerStatus, runtimeName strin
+ 		State:        toKubeContainerState(status.State),
+ 		CreatedAt:    time.Unix(0, status.CreatedAt),
+ 	}
++	if annotatedInfo.Image != "" {
++		cStatus.Image = annotatedInfo.Image
++	}
+ 
+ 	if status.State != runtimeapi.ContainerState_CONTAINER_CREATED {
+ 		// If container is not in the created state, we have tried and
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container_test.go b/pkg/kubelet/kuberuntime/kuberuntime_container_test.go
+index 51ad8c73c9a..90f9c72ccdb 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_container_test.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container_test.go
+@@ -218,6 +218,26 @@ func TestToKubeContainerStatus(t *testing.T) {
+ 				StartedAt: time.Unix(0, startedAt),
+ 			},
+ 		},
++		"right image from annotations": {
++			input: &runtimeapi.ContainerStatus{
++				Id:        cid.ID,
++				Metadata:  meta,
++				Image:     imageSpec,
++				State:     runtimeapi.ContainerState_CONTAINER_RUNNING,
++				CreatedAt: createdAt,
++				StartedAt: startedAt,
++				Annotations: map[string]string{
++					containerImageLabel: "fimage-alias",
++				},
++			},
++			expected: &kubecontainer.Status{
++				ID:        *cid,
++				Image:     "fimage-alias",
++				State:     kubecontainer.ContainerStateRunning,
++				CreatedAt: time.Unix(0, createdAt),
++				StartedAt: time.Unix(0, startedAt),
++			},
++		},
+ 	} {
+ 		actual := toKubeContainerStatus(test.input, cid.Type)
+ 		assert.Equal(t, test.expected, actual, desc)
+diff --git a/pkg/kubelet/kuberuntime/labels.go b/pkg/kubelet/kuberuntime/labels.go
+index 2aaa1743ac6..cb66e9b1768 100644
+--- a/pkg/kubelet/kuberuntime/labels.go
++++ b/pkg/kubelet/kuberuntime/labels.go
+@@ -32,6 +32,7 @@ const (
+ 	podDeletionGracePeriodLabel    = "io.kubernetes.pod.deletionGracePeriod"
+ 	podTerminationGracePeriodLabel = "io.kubernetes.pod.terminationGracePeriod"
+ 
++	containerImageLabel                    = "io.kubernetes.container.image"
+ 	containerHashLabel                     = "io.kubernetes.container.hash"
+ 	containerRestartCountLabel             = "io.kubernetes.container.restartCount"
+ 	containerTerminationMessagePathLabel   = "io.kubernetes.container.terminationMessagePath"
+@@ -61,6 +62,7 @@ type labeledContainerInfo struct {
+ }
+ 
+ type annotatedContainerInfo struct {
++	Image                     string
+ 	Hash                      uint64
+ 	RestartCount              int
+ 	PodDeletionGracePeriod    *int64
+@@ -112,6 +114,7 @@ func newContainerAnnotations(container *v1.Container, pod *v1.Pod, restartCount
+ 		annotations[a.Name] = a.Value
+ 	}
+ 
++	annotations[containerImageLabel] = container.Image
+ 	annotations[containerHashLabel] = strconv.FormatUint(kubecontainer.HashContainer(container), 16)
+ 	annotations[containerRestartCountLabel] = strconv.Itoa(restartCount)
+ 	annotations[containerTerminationMessagePathLabel] = container.TerminationMessagePath
+@@ -186,6 +189,7 @@ func getContainerInfoFromLabels(labels map[string]string) *labeledContainerInfo
+ func getContainerInfoFromAnnotations(annotations map[string]string) *annotatedContainerInfo {
+ 	var err error
+ 	containerInfo := &annotatedContainerInfo{
++		Image:                    getStringValueFromLabel(annotations, containerImageLabel),
+ 		TerminationMessagePath:   getStringValueFromLabel(annotations, containerTerminationMessagePathLabel),
+ 		TerminationMessagePolicy: v1.TerminationMessagePolicy(getStringValueFromLabel(annotations, containerTerminationMessagePolicyLabel)),
+ 	}

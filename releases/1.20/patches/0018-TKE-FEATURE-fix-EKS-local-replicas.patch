@@ -1,0 +1,61 @@
+diff --git a/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go b/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
+index d9304639f58..4c94f8295d1 100644
+--- a/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
++++ b/pkg/scheduler/framework/plugins/localreplicas/local_replicas.go
+@@ -58,7 +58,7 @@ func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, po
+ 		localReplicas = 0
+ 	}
+ 	if localReplicas == 0 {
+-		return filterLocalNode(nodeInfo.Node())
++		return pl.filterLocalNode(nodeInfo.Node())
+ 	}
+ 
+ 	//make sure that the previous scheduled pod has nodeName
+@@ -68,7 +68,7 @@ func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, po
+ 	if !ok {
+ 		return framework.NewStatus(framework.Error, "podinformer not found")
+ 	}
+-	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: pod.Labels})
++	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: pl.filterNoisyLabels(pod.Labels)})
+ 	if err != nil {
+ 		return framework.NewStatus(framework.Error, fmt.Sprintf("failed to parse pod labels:%s", err.Error()))
+ 	}
+@@ -107,7 +107,7 @@ func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, po
+ 			}
+ 			cm, err := kubeclient.CoreV1().ConfigMaps(scaleEKSConfNS).Get(context.TODO(), EKSConfigMap, metav1.GetOptions{})
+ 			if err == nil && cm.Data[autoScaleEKS] == "false" {
+-				return filterEKSNode(nodeInfo.Node())
++				return pl.filterEKSNode(nodeInfo.Node())
+ 			} else {
+ 				return nil
+ 			}
+@@ -115,19 +115,26 @@ func (pl *LocalReplicas) Filter(ctx context.Context, _ *framework.CycleState, po
+ 	}
+ 
+ 	if actualLocalReplicas >= localReplicas {
+-		return filterLocalNode(nodeInfo.Node())
++		return pl.filterLocalNode(nodeInfo.Node())
+ 	}
+ 	return nil
+ }
+ 
+-func filterLocalNode(node *v1.Node) *framework.Status {
++// support local replicas on statefulset pods
++// Ref: http://tapd.oa.com/eks/prong/stories/view/1020426016866124987
++func (_ *LocalReplicas) filterNoisyLabels(labels map[string]string) map[string]string {
++	delete(labels, "statefulset.kubernetes.io/pod-name")
++	return labels
++}
++
++func (_ *LocalReplicas) filterLocalNode(node *v1.Node) *framework.Status {
+ 	if util.IsEkletNode(node) {
+ 		return nil
+ 	}
+ 	return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason)
+ }
+ 
+-func filterEKSNode(node *v1.Node) *framework.Status {
++func (_ *LocalReplicas) filterEKSNode(node *v1.Node) *framework.Status {
+ 	if util.IsEkletNode(node) {
+ 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason)
+ 	}

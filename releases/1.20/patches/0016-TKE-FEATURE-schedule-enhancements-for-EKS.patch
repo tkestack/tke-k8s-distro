@@ -1,0 +1,510 @@
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index 311a8d47716..d4313fa6fda 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -732,6 +732,12 @@ const (
+ 	//
+ 	// Schedule pods according to remain resources in available zone.
+ 	EnableComputeResource featuregate.Feature = "EnableComputeResource"
++
++	// owner @tke.tencent
++	// alpha: v1.20
++	//
++	// Schedule pods according to remain IP resource in the subnet of virtual node.
++	EnableFitIPResource featuregate.Feature = "EnableFitIPResource"
+ )
+ 
+ func init() {
+@@ -860,6 +866,7 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
+ 	HPAScaleToZero:         {Default: false, PreRelease: featuregate.Alpha},
+ 	LegacyNodeRoleBehavior: {Default: true, PreRelease: featuregate.Beta},
+ 
+-	// tke specific features
+-	EnableComputeResource:   {Default: true, PreRelease: featuregate.Alpha},
++	// eks specific features
++	EnableComputeResource: {Default: true, PreRelease: featuregate.Alpha},
++	EnableFitIPResource:   {Default: true, PreRelease: featuregate.Alpha},
+ }
+diff --git a/pkg/scheduler/algorithmprovider/registry.go b/pkg/scheduler/algorithmprovider/registry.go
+index 42f86a692d9..6307d9a0ea0 100644
+--- a/pkg/scheduler/algorithmprovider/registry.go
++++ b/pkg/scheduler/algorithmprovider/registry.go
+@@ -19,6 +19,7 @@ package algorithmprovider
+ import (
+ 	"fmt"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/computeresource"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/fitipresource"
+ 
+ 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	"k8s.io/klog/v2"
+@@ -84,6 +85,7 @@ func getDefaultConfig() *schedulerapi.Plugins {
+ 				{Name: podtopologyspread.Name},
+ 				{Name: interpodaffinity.Name},
+ 				{Name: volumebinding.Name},
++				{Name: computeresource.Name},
+ 			},
+ 		},
+ 		Filter: &schedulerapi.PluginSet{
+@@ -105,6 +107,7 @@ func getDefaultConfig() *schedulerapi.Plugins {
+ 				{Name: interpodaffinity.Name},
+ 				{Name: computeresource.Name},
+ 				{Name: localreplicas.Name},
++				{Name: fitipresource.Name},
+ 			},
+ 		},
+ 		PostFilter: &schedulerapi.PluginSet{
+diff --git a/pkg/scheduler/framework/plugins/fitipresource/fit_ip_resource.go b/pkg/scheduler/framework/plugins/fitipresource/fit_ip_resource.go
+new file mode 100644
+index 00000000000..3fcc65df897
+--- /dev/null
++++ b/pkg/scheduler/framework/plugins/fitipresource/fit_ip_resource.go
+@@ -0,0 +1,57 @@
++package fitipresource
++
++import (
++	"context"
++	"fmt"
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/klog/v2"
++	"k8s.io/kubernetes/pkg/scheduler/framework"
++	"k8s.io/kubernetes/pkg/scheduler/util"
++)
++
++const (
++	// Name is the name of the plugin used in the plugin registry and configurations.
++	Name = "FitIPResource"
++)
++
++type FitIPResource struct {
++}
++
++var _ framework.FilterPlugin = &FitIPResource{}
++
++// Name returns name of the plugin. It is used in logs, etc.
++func (f *FitIPResource) Name() string {
++	return Name
++}
++
++// Filter invoked at the filter extension point.
++func (f *FitIPResource) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
++	node := nodeInfo.Node()
++	if node == nil {
++		return framework.NewStatus(framework.Error, fmt.Sprintf("node not found"))
++	}
++	if !util.IsEkletNode(node) {
++		// 不是eklet节点，调度器放过
++		return nil
++	}
++	klog.V(4).Infof("Run filter FitIPResource for pod %s on eklet node \"%s\".", pod.Name, node.Name)
++
++	allowedIPCount, exists := util.AllowedIPCount(node)
++	if !exists { // when eklet doesn't work immediately, skip this policy
++		klog.V(4).Infof("pod \"%s/%s\" skip filter FitIPResource on node \"%s\" because no available-ip-count label on node now.", pod.Namespace, pod.Name, node.Name)
++		return nil
++	}
++
++	usedIPResource := nodeInfo.UsedIPResource()
++	klog.V(4).Infof("node %s consume ip resource %d, allowedIPCount %d", node.Name, usedIPResource, allowedIPCount)
++	if allowedIPCount <= usedIPResource {
++		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Insufficient ip resource"))
++	}
++	return nil
++}
++
++// New initializes a new plugin and returns it.
++func New(_ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
++	return &FitIPResource{}, nil
++}
+diff --git a/pkg/scheduler/framework/plugins/legacy_registry.go b/pkg/scheduler/framework/plugins/legacy_registry.go
+index c1c1613d838..9c552ee0c03 100644
+--- a/pkg/scheduler/framework/plugins/legacy_registry.go
++++ b/pkg/scheduler/framework/plugins/legacy_registry.go
+@@ -26,6 +26,7 @@ import (
+ 	"k8s.io/kubernetes/pkg/features"
+ 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/computeresource"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/fitipresource"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/imagelocality"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/localreplicas"
+@@ -87,6 +88,8 @@ const (
+ )
+ 
+ const (
++	// FitIPResource defines the name of predicate FitIPResource.
++	FitIPResourcePred = "FitIPResourcePred"
+ 	// MatchInterPodAffinityPred defines the name of predicate MatchInterPodAffinity.
+ 	MatchInterPodAffinityPred = "MatchInterPodAffinity"
+ 	// CheckVolumeBindingPred defines the name of predicate CheckVolumeBinding.
+@@ -149,7 +152,7 @@ var predicateOrdering = []string{
+ 	PodToleratesNodeTaintsPred, CheckNodeLabelPresencePred,
+ 	CheckServiceAffinityPred, MaxEBSVolumeCountPred, MaxGCEPDVolumeCountPred, MaxCSIVolumeCountPred,
+ 	MaxAzureDiskVolumeCountPred, MaxCinderVolumeCountPred, CheckVolumeBindingPred, NoVolumeZoneConflictPred,
+-	EvenPodsSpreadPred, MatchInterPodAffinityPred, CheckComputeResourcePred, CheckLocalReplicasPred,MaxQcloudCbsVolumeCount,
++	EvenPodsSpreadPred, MatchInterPodAffinityPred, CheckComputeResourcePred, CheckLocalReplicasPred, MaxQcloudCbsVolumeCount, FitIPResourcePred,
+ }
+ 
+ // LegacyRegistry is used to store current state of registered predicates and priorities.
+@@ -482,6 +485,16 @@ func NewLegacyRegistry() *LegacyRegistry {
+ 			})
+ 		registry.DefaultPriorities[ComputeResourcePriority] = 1
+ 	}
++
++	// Only register FitIPResource predicate if the feature is enabled
++	if feature.DefaultFeatureGate.Enabled(features.EnableFitIPResource) {
++		klog.Infof("Registering FitIPResource predicate function")
++		registry.registerPredicateConfigProducer(FitIPResourcePred,
++			func(_ ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
++				plugins.Filter = appendToPluginSet(plugins.Filter, fitipresource.Name, nil)
++			})
++		registry.DefaultPredicates.Insert(FitIPResourcePred)
++	}
+ 	return registry
+ }
+ 
+diff --git a/pkg/scheduler/framework/plugins/registry.go b/pkg/scheduler/framework/plugins/registry.go
+index 19eddc3d143..10da1629070 100644
+--- a/pkg/scheduler/framework/plugins/registry.go
++++ b/pkg/scheduler/framework/plugins/registry.go
+@@ -20,6 +20,7 @@ import (
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/computeresource"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/fitipresource"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/imagelocality"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/localreplicas"
+@@ -78,5 +79,6 @@ func NewInTreeRegistry() runtime.Registry {
+ 		computeresource.Name:                       computeresource.New,
+ 		localreplicas.Name:                         localreplicas.New,
+ 		nodevolumelimits.QcloudCBSName:             nodevolumelimits.NewQcloudCBS,
++		fitipresource.Name:                         fitipresource.New,
+ 	}
+ }
+\ No newline at end of file
+diff --git a/pkg/scheduler/framework/types.go b/pkg/scheduler/framework/types.go
+index 7b7f19256d1..90a2a789698 100644
+--- a/pkg/scheduler/framework/types.go
++++ b/pkg/scheduler/framework/types.go
+@@ -202,6 +202,8 @@ type NodeInfo struct {
+ 	// Ports allocated on the node.
+ 	UsedPorts HostPortInfo
+ 
++	usedEkletIPResource int
++
+ 	// Total requested resources of all pods on this node. This includes assumed
+ 	// pods, which scheduler has sent for binding, but may not be scheduled yet.
+ 	Requested *Resource
+@@ -412,13 +414,14 @@ func (r *Resource) SetMaxResource(rl v1.ResourceList) {
+ // the returned object.
+ func NewNodeInfo(pods ...*v1.Pod) *NodeInfo {
+ 	ni := &NodeInfo{
+-		Requested:        &Resource{},
+-		NonZeroRequested: &Resource{},
+-		Allocatable:      &Resource{},
+-		TransientInfo:    NewTransientSchedulerInfo(),
+-		Generation:       nextGeneration(),
+-		UsedPorts:        make(HostPortInfo),
+-		ImageStates:      make(map[string]*ImageStateSummary),
++		Requested:           &Resource{},
++		NonZeroRequested:    &Resource{},
++		Allocatable:         &Resource{},
++		TransientInfo:       NewTransientSchedulerInfo(),
++		Generation:          nextGeneration(),
++		UsedPorts:           make(HostPortInfo),
++		usedEkletIPResource: 0,
++		ImageStates:         make(map[string]*ImageStateSummary),
+ 	}
+ 	for _, pod := range pods {
+ 		ni.AddPod(pod)
+@@ -434,17 +437,26 @@ func (n *NodeInfo) Node() *v1.Node {
+ 	return n.node
+ }
+ 
++// UsedPorts returns used ports on this node.
++func (n *NodeInfo) UsedIPResource() int {
++	if !schedutil.IsEkletNode(n.node) {
++		return 0
++	}
++	return n.usedEkletIPResource
++}
++
+ // Clone returns a copy of this node.
+ func (n *NodeInfo) Clone() *NodeInfo {
+ 	clone := &NodeInfo{
+-		node:             n.node,
+-		Requested:        n.Requested.Clone(),
+-		NonZeroRequested: n.NonZeroRequested.Clone(),
+-		Allocatable:      n.Allocatable.Clone(),
+-		TransientInfo:    n.TransientInfo,
+-		UsedPorts:        make(HostPortInfo),
+-		ImageStates:      n.ImageStates,
+-		Generation:       n.Generation,
++		node:                n.node,
++		Requested:           n.Requested.Clone(),
++		NonZeroRequested:    n.NonZeroRequested.Clone(),
++		Allocatable:         n.Allocatable.Clone(),
++		TransientInfo:       n.TransientInfo,
++		UsedPorts:           make(HostPortInfo),
++		ImageStates:         n.ImageStates,
++		Generation:          n.Generation,
++		usedEkletIPResource: n.usedEkletIPResource,
+ 	}
+ 	if len(n.Pods) > 0 {
+ 		clone.Pods = append([]*PodInfo(nil), n.Pods...)
+@@ -480,6 +492,10 @@ func (n *NodeInfo) String() string {
+ 
+ // AddPod adds pod information to this NodeInfo.
+ func (n *NodeInfo) AddPod(pod *v1.Pod) {
++	n.addPod(pod, false)
++}
++
++func (n *NodeInfo) addPod(pod *v1.Pod, assumedOnEkletNode bool) {
+ 	podInfo := NewPodInfo(pod)
+ 	res, non0CPU, non0Mem := calculateResource(pod)
+ 	n.Requested.MilliCPU += res.MilliCPU
+@@ -504,9 +520,21 @@ func (n *NodeInfo) AddPod(pod *v1.Pod) {
+ 	// Consume ports when pods added.
+ 	n.updateUsedPorts(podInfo.Pod, true)
+ 
++	if assumedOnEkletNode {
++		klog.V(4).Infof("consume node %s ip resource, used ip resource=%d", n.node.Name, n.UsedIPResource()+1)
++		n.usedEkletIPResource++
++	}
++
+ 	n.Generation = nextGeneration()
+ }
+ 
++// AddAssumedPod adds assumed pod information to this eklet NodeInfo.
++// It is a must to check the pod is in assumed before trigger this func
++func (n *NodeInfo) AddAssumedPod(pod *v1.Pod) {
++	klog.V(4).Infof("AddAssumedPod when add pod %s", pod.Name)
++	n.addPod(pod, schedutil.IsEkletNode(n.node))
++}
++
+ func podWithAffinity(p *v1.Pod) bool {
+ 	affinity := p.Spec.Affinity
+ 	return affinity != nil && (affinity.PodAffinity != nil || affinity.PodAntiAffinity != nil)
+@@ -537,6 +565,10 @@ func removeFromSlice(s []*PodInfo, k string) []*PodInfo {
+ 
+ // RemovePod subtracts pod information from this NodeInfo.
+ func (n *NodeInfo) RemovePod(pod *v1.Pod) error {
++	return n.removePod(pod, false)
++}
++
++func (n *NodeInfo) removePod(pod *v1.Pod, assumedOnEkletNode bool) error {
+ 	k, err := GetPodKey(pod)
+ 	if err != nil {
+ 		return err
+@@ -576,6 +608,10 @@ func (n *NodeInfo) RemovePod(pod *v1.Pod) error {
+ 			// Release ports when remove Pods.
+ 			n.updateUsedPorts(pod, false)
+ 
++			if assumedOnEkletNode {
++				klog.V(4).Infof("dec node %s ip resource, used ip resource=%d", n.node.Name, n.UsedIPResource()-1)
++				n.usedEkletIPResource--
++			}
+ 			n.Generation = nextGeneration()
+ 			n.resetSlicesIfEmpty()
+ 			return nil
+@@ -584,6 +620,13 @@ func (n *NodeInfo) RemovePod(pod *v1.Pod) error {
+ 	return fmt.Errorf("no corresponding pod %s in pods of node %s", pod.Name, n.node.Name)
+ }
+ 
++// RemoveAssumedPod subtracts assumed pod information from this NodeInfo.
++// It is a must to check the pod is in assumed before trigger this func
++func (n *NodeInfo) RemoveAssumedPod(pod *v1.Pod) error {
++	klog.V(4).Infof("RemoveAssumedPod when remove pod %s", pod.Name)
++	return n.removePod(pod, schedutil.IsEkletNode(n.node))
++}
++
+ // resets the slices to nil so that we can do DeepEqual in unit tests.
+ func (n *NodeInfo) resetSlicesIfEmpty() {
+ 	if len(n.PodsWithAffinity) == 0 {
+@@ -652,13 +695,28 @@ func (n *NodeInfo) updateUsedPorts(pod *v1.Pod, add bool) {
+ 
+ // SetNode sets the overall node information.
+ func (n *NodeInfo) SetNode(node *v1.Node) error {
++	return n.setNode(node, false)
++}
++
++func (n *NodeInfo) setNode(node *v1.Node, ekletIPResourceChanged bool) error {
+ 	n.node = node
++
++	if ekletIPResourceChanged {
++		n.usedEkletIPResource = 0
++	}
++
+ 	n.Allocatable = NewResource(node.Status.Allocatable)
+ 	n.TransientInfo = NewTransientSchedulerInfo()
+ 	n.Generation = nextGeneration()
+ 	return nil
+ }
+ 
++// SetEkletNode sets the overall node information if eklet available ip count changes.
++// It is a must to check the node available ip count changes
++func (n *NodeInfo) SetEkletNode(node *v1.Node) error {
++	return n.setNode(node, schedutil.IsEkletNode(node))
++}
++
+ // RemoveNode removes the node object, leaving all other tracking information.
+ func (n *NodeInfo) RemoveNode() {
+ 	n.node = nil
+diff --git a/pkg/scheduler/internal/cache/cache.go b/pkg/scheduler/internal/cache/cache.go
+index 3ab343f487f..ed51ea41213 100644
+--- a/pkg/scheduler/internal/cache/cache.go
++++ b/pkg/scheduler/internal/cache/cache.go
+@@ -29,6 +29,7 @@ import (
+ 	"k8s.io/kubernetes/pkg/features"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework"
+ 	"k8s.io/kubernetes/pkg/scheduler/metrics"
++	"k8s.io/kubernetes/pkg/scheduler/util"
+ )
+ 
+ var (
+@@ -370,12 +371,12 @@ func (cache *schedulerCache) AssumePod(pod *v1.Pod) error {
+ 		return fmt.Errorf("pod %v is in the cache, so can't be assumed", key)
+ 	}
+ 
++	cache.assumedPods[key] = true
+ 	cache.addPod(pod)
+ 	ps := &podState{
+ 		pod: pod,
+ 	}
+ 	cache.podStates[key] = ps
+-	cache.assumedPods[key] = true
+ 	return nil
+ }
+ 
+@@ -439,7 +440,11 @@ func (cache *schedulerCache) addPod(pod *v1.Pod) {
+ 		n = newNodeInfoListItem(framework.NewNodeInfo())
+ 		cache.nodes[pod.Spec.NodeName] = n
+ 	}
+-	n.info.AddPod(pod)
++	if cache.assumedPod(pod) {
++		n.info.AddAssumedPod(pod)
++	} else {
++		n.info.AddPod(pod)
++	}
+ 	cache.moveNodeInfoToHead(pod.Spec.NodeName)
+ }
+ 
+@@ -462,7 +467,14 @@ func (cache *schedulerCache) removePod(pod *v1.Pod) error {
+ 		klog.Errorf("node %v not found when trying to remove pod %v", pod.Spec.NodeName, pod.Name)
+ 		return nil
+ 	}
+-	if err := n.info.RemovePod(pod); err != nil {
++
++	var err error
++	if cache.assumedPod(pod) {
++		err = n.info.RemoveAssumedPod(pod)
++	} else {
++		err = n.info.RemovePod(pod)
++	}
++	if err != nil {
+ 		return err
+ 	}
+ 	if len(n.info.Pods) == 0 && n.info.Node() == nil {
+@@ -473,6 +485,17 @@ func (cache *schedulerCache) removePod(pod *v1.Pod) error {
+ 	return nil
+ }
+ 
++func (cache *schedulerCache) assumedPod(pod *v1.Pod) bool {
++	key, err := framework.GetPodKey(pod)
++	if err != nil {
++		return false
++	}
++	if cache.assumedPods[key] {
++		return true
++	}
++	return false
++}
++
+ func (cache *schedulerCache) AddPod(pod *v1.Pod) error {
+ 	key, err := framework.GetPodKey(pod)
+ 	if err != nil {
+@@ -521,6 +544,7 @@ func (cache *schedulerCache) UpdatePod(oldPod, newPod *v1.Pod) error {
+ 
+ 	currState, ok := cache.podStates[key]
+ 	switch {
++	// TODO: debug here, if pod in assume but updated in NodeName
+ 	// An assumed pod won't have Update/Remove event. It needs to have Add event
+ 	// before Update event, in which case the state would change from Assumed to Added.
+ 	case ok && !cache.assumedPods[key]:
+@@ -636,6 +660,13 @@ func (cache *schedulerCache) UpdateNode(oldNode, newNode *v1.Node) error {
+ 
+ 	cache.nodeTree.updateNode(oldNode, newNode)
+ 	cache.addNodeImageStates(newNode, n.info)
++	if util.IsEkletNode(newNode) {
++		oldIPCount, _ := util.AllowedIPCount(oldNode)
++		newIPCount, _ := util.AllowedIPCount(newNode)
++		if oldIPCount != newIPCount {
++			return n.info.SetEkletNode(newNode)
++		}
++	}
+ 	return n.info.SetNode(newNode)
+ }
+ 
+diff --git a/pkg/scheduler/util/eklet_helper.go b/pkg/scheduler/util/eklet_helper.go
+index 1c129f22041..e0b642c025a 100644
+--- a/pkg/scheduler/util/eklet_helper.go
++++ b/pkg/scheduler/util/eklet_helper.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 
+ 	v1 "k8s.io/api/core/v1"
++	"k8s.io/klog/v2"
+ )
+ 
+ const (
+@@ -20,6 +21,13 @@ const (
+ 	// AnnotationGPUType is the annotation key of GPU type.
+ 	AnnotationGPUType = "eks.tke.cloud.tencent.com/gpu-type"
+ 	taintEKLetNodeKey = "eks.tke.cloud.tencent.com/eklet"
++
++	// annotationPodRetainIP is the annotation key of retain ip.
++	annotationPodRetainIP = "eks.tke.cloud.tencent.com/retain-ip"
++	// annotationPodStaticIP is the annotation key of static ip.
++	annotationPodStaticIP = "eks.tke.cloud.tencent.com/static-ip"
++	// labelAvailableIPResource is the label key of left ip count in the subnet.
++	labelAvailableIPResource = "eks.tke.cloud.tencent.com/available-ip-count"
+ )
+ 
+ var EKLetToleration = &v1.Toleration{
+@@ -112,3 +120,35 @@ func ResourcesSufficientIndex(resLabels []string, node *v1.Node) int {
+ 	}
+ 	return -1
+ }
++
++func StaticIPPod(annotations map[string]string) bool {
++	val, ok := annotations[annotationPodRetainIP]
++	if ok && val == "true" {
++		return true
++	}
++	val, ok = annotations[annotationPodStaticIP]
++	if ok && val == "true" {
++		return true
++	}
++	return false
++}
++
++func EkletStaticIPConfigMapName() string {
++	return "static-addresses"
++}
++
++func AllowedIPCount(node *v1.Node) (int, bool) {
++	if node == nil || node.Labels == nil {
++		return 0, false
++	}
++	val, exist := node.Labels[labelAvailableIPResource]
++	if !exist {
++		return 0, false
++	}
++	allowedIPCount, err := strconv.Atoi(val)
++	if err != nil {
++		klog.Errorf("failed to convert string %s to int in node %s labels[%s], err: %v", val, node.Name, labelAvailableIPResource, err.Error())
++		return 0, false
++	}
++	return allowedIPCount, exist
++}

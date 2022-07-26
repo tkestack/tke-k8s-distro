@@ -1,0 +1,413 @@
+diff --git a/pkg/scheduler/apis/config/types.go b/pkg/scheduler/apis/config/types.go
+index 531f20d153c..b5eb87c7530 100644
+--- a/pkg/scheduler/apis/config/types.go
++++ b/pkg/scheduler/apis/config/types.go
+@@ -337,6 +337,10 @@ type Extender struct {
+ 	// If this method is implemented by the extender, it is the extender's responsibility to bind the pod to apiserver. Only one extender
+ 	// can implement this function.
+ 	BindVerb string
++	// Verb for the prebind call, empty if not supported. This verb is appended to the URLPrefix when issuing the prebind call to extender.
++	PrebindVerb string
++	// Verb for the unreserve call, empty if not supported. This verb is appended to the URLPrefix when issuing the bind call to extender.
++	UnreserveVerb string
+ 	// EnableHTTPS specifies whether https should be used to communicate with the extender
+ 	EnableHTTPS bool
+ 	// TLSConfig specifies the transport layer security config
+diff --git a/pkg/scheduler/apis/config/v1/conversion.go b/pkg/scheduler/apis/config/v1/conversion.go
+index 06a6c7073f7..34ef3f5065e 100644
+--- a/pkg/scheduler/apis/config/v1/conversion.go
++++ b/pkg/scheduler/apis/config/v1/conversion.go
+@@ -29,6 +29,8 @@ func Convert_v1_LegacyExtender_To_config_Extender(in *v1.LegacyExtender, out *co
+ 	out.PrioritizeVerb = in.PrioritizeVerb
+ 	out.Weight = in.Weight
+ 	out.BindVerb = in.BindVerb
++	out.PrebindVerb = in.PrebindVerb
++	out.UnreserveVerb = in.UnreserveVerb
+ 	out.EnableHTTPS = in.EnableHTTPS
+ 	out.HTTPTimeout.Duration = in.HTTPTimeout
+ 	out.NodeCacheCapable = in.NodeCacheCapable
+@@ -65,6 +67,8 @@ func Convert_config_Extender_To_v1_LegacyExtender(in *config.Extender, out *v1.L
+ 	out.PrioritizeVerb = in.PrioritizeVerb
+ 	out.Weight = in.Weight
+ 	out.BindVerb = in.BindVerb
++	out.PrebindVerb = in.PrebindVerb
++	out.UnreserveVerb = in.UnreserveVerb
+ 	out.EnableHTTPS = in.EnableHTTPS
+ 	out.HTTPTimeout = in.HTTPTimeout.Duration
+ 	out.NodeCacheCapable = in.NodeCacheCapable
+diff --git a/pkg/scheduler/apis/config/v1beta1/zz_generated.conversion.go b/pkg/scheduler/apis/config/v1beta1/zz_generated.conversion.go
+index 66b69707378..bc43ccc0bc2 100644
+--- a/pkg/scheduler/apis/config/v1beta1/zz_generated.conversion.go
++++ b/pkg/scheduler/apis/config/v1beta1/zz_generated.conversion.go
+@@ -280,6 +280,8 @@ func autoConvert_v1beta1_Extender_To_config_Extender(in *v1beta1.Extender, out *
+ 	out.PrioritizeVerb = in.PrioritizeVerb
+ 	out.Weight = in.Weight
+ 	out.BindVerb = in.BindVerb
++	out.PrebindVerb = in.PrebindVerb
++	out.UnreserveVerb = in.UnreserveVerb
+ 	out.EnableHTTPS = in.EnableHTTPS
+ 	out.TLSConfig = (*config.ExtenderTLSConfig)(unsafe.Pointer(in.TLSConfig))
+ 	out.HTTPTimeout = in.HTTPTimeout
+@@ -301,6 +303,8 @@ func autoConvert_config_Extender_To_v1beta1_Extender(in *config.Extender, out *v
+ 	out.PrioritizeVerb = in.PrioritizeVerb
+ 	out.Weight = in.Weight
+ 	out.BindVerb = in.BindVerb
++	out.PrebindVerb = in.PrebindVerb
++	out.UnreserveVerb = in.UnreserveVerb
+ 	out.EnableHTTPS = in.EnableHTTPS
+ 	out.TLSConfig = (*configv1.ExtenderTLSConfig)(unsafe.Pointer(in.TLSConfig))
+ 	out.HTTPTimeout = in.HTTPTimeout
+diff --git a/pkg/scheduler/core/extender.go b/pkg/scheduler/core/extender.go
+index 86364422e6f..bedbefd3c9b 100644
+--- a/pkg/scheduler/core/extender.go
++++ b/pkg/scheduler/core/extender.go
+@@ -45,6 +45,8 @@ type HTTPExtender struct {
+ 	filterVerb       string
+ 	prioritizeVerb   string
+ 	bindVerb         string
++	prebindVerb      string
++	unreserveVerb    string
+ 	weight           int64
+ 	client           *http.Client
+ 	nodeCacheCapable bool
+@@ -106,6 +108,8 @@ func NewHTTPExtender(config *schedulerapi.Extender) (framework.Extender, error)
+ 		filterVerb:       config.FilterVerb,
+ 		prioritizeVerb:   config.PrioritizeVerb,
+ 		bindVerb:         config.BindVerb,
++		prebindVerb:      config.PrebindVerb,
++		unreserveVerb:    config.UnreserveVerb,
+ 		weight:           config.Weight,
+ 		client:           client,
+ 		nodeCacheCapable: config.NodeCacheCapable,
+@@ -161,6 +165,18 @@ func (h *HTTPExtender) SupportsPreemption() bool {
+ 	return len(h.preemptVerb) > 0
+ }
+ 
++// SupportsPrebind returns true if an extender supports prebind.
++// An extender should have prebind verb defined and enabled its own node cache.
++func (h *HTTPExtender) SupportsPrebind() bool {
++	return len(h.prebindVerb) > 0
++}
++
++// SupportsUnreserve returns true if an extender supports unreserve.
++// An extender should have unreserve Verb verb defined and enabled its own node cache.
++func (h *HTTPExtender) SupportsUnreserve() bool {
++	return len(h.unreserveVerb) > 0
++}
++
+ // ProcessPreemption returns filtered candidate nodes and victims after running preemption logic in extender.
+ func (h *HTTPExtender) ProcessPreemption(
+ 	pod *v1.Pod,
+@@ -405,6 +421,48 @@ func (h *HTTPExtender) Bind(binding *v1.Binding) error {
+ 	return nil
+ }
+ 
++// Prebind delegates the action of prebinding a pod to a node to the extender.
++func (h *HTTPExtender) Prebind(binding *v1.Binding) error {
++	var result extenderv1.ExtenderBindingResult
++	if h.prebindVerb == "" {
++		return fmt.Errorf("Unexpected empty prebindVerb in extender")
++	}
++	req := &extenderv1.ExtenderBindingArgs{
++		PodName:      binding.Name,
++		PodNamespace: binding.Namespace,
++		PodUID:       binding.UID,
++		Node:         binding.Target.Name,
++	}
++	if err := h.send(h.prebindVerb, &req, &result); err != nil {
++		return err
++	}
++	if result.Error != "" {
++		return fmt.Errorf(result.Error)
++	}
++	return nil
++}
++
++// Unreserve delegates the action of unreserving a pod to a node to the extender.
++func (h *HTTPExtender) Unreserve(binding *v1.Binding) error {
++	var result extenderv1.ExtenderBindingResult
++	if h.unreserveVerb == "" {
++		return fmt.Errorf("Unexpected empty unreserveVerb in extender")
++	}
++	req := &extenderv1.ExtenderBindingArgs{
++		PodName:      binding.Name,
++		PodNamespace: binding.Namespace,
++		PodUID:       binding.UID,
++		Node:         binding.Target.Name,
++	}
++	if err := h.send(h.unreserveVerb, &req, &result); err != nil {
++		return err
++	}
++	if result.Error != "" {
++		return fmt.Errorf(result.Error)
++	}
++	return nil
++}
++
+ // IsBinder returns whether this extender is configured for the Bind method.
+ func (h *HTTPExtender) IsBinder() bool {
+ 	return h.bindVerb != ""
+diff --git a/pkg/scheduler/core/generic_scheduler.go b/pkg/scheduler/core/generic_scheduler.go
+index c9cdd774d50..dfae696ff52 100644
+--- a/pkg/scheduler/core/generic_scheduler.go
++++ b/pkg/scheduler/core/generic_scheduler.go
+@@ -24,6 +24,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"k8s.io/apimachinery/pkg/util/errors"
+ 	"k8s.io/klog/v2"
+ 
+ 	v1 "k8s.io/api/core/v1"
+@@ -63,6 +64,10 @@ type ScheduleAlgorithm interface {
+ 	// Extenders returns a slice of extender config. This is exposed for
+ 	// testing.
+ 	Extenders() []framework.Extender
++
++	Prebind(*v1.Pod, *v1.Binding) ([]framework.Extender, error)
++
++	Unreserve(*v1.Pod, *v1.Binding, []framework.Extender) error
+ }
+ 
+ // ScheduleResult represents the result of one pod scheduled. It will contain
+@@ -149,6 +154,52 @@ func (g *genericScheduler) Extenders() []framework.Extender {
+ 	return g.extenders
+ }
+ 
++// Prebind tries to call prebind action of all interested exntenders.
++func (g *genericScheduler) Prebind(pod *v1.Pod, binding *v1.Binding) ([]framework.Extender, error) {
++	var calledExtenders []framework.Extender
++	for _, extender := range g.extenders {
++		if !extender.IsInterested(pod) || !extender.SupportsPrebind() {
++			continue
++		}
++
++		klog.V(4).Infof("for pod %s/%s: calling Prebind action of extender %s", pod.Namespace, pod.Name, extender.Name())
++		err := extender.Prebind(binding)
++		if err != nil {
++			errUnreserve := g.Unreserve(pod, binding, calledExtenders)
++			if errUnreserve != nil {
++				klog.Errorf("for pod %s/%s: failed to do Unreserve: %v", pod.Namespace, pod.Name, errUnreserve)
++			}
++			err = fmt.Errorf("error while calling Prebind action of extender %s: %v", extender.Name(), err)
++			return nil, err
++		}
++
++		calledExtenders = append(calledExtenders, extender)
++	}
++
++	return calledExtenders, nil
++}
++
++// Unreserve tries to call unreserve action of all prebind-called exntenders to release resources, in reverse order,
++// if there are errors during the course of prebinding or binding.
++func (g *genericScheduler) Unreserve(pod *v1.Pod, binding *v1.Binding, calledExtenders []framework.Extender) error {
++	var errs []error
++	count := len(calledExtenders)
++	for i := count - 1; i >= 0; i-- {
++		extender := calledExtenders[i]
++		if !extender.IsInterested(pod) || !extender.SupportsUnreserve() {
++			continue
++		}
++
++		klog.V(4).Infof("for pod %s:%s: calling Unreserve action of extender %s", pod.Namespace, pod.Name, extender.Name())
++		err := extender.Unreserve(binding)
++		if err != nil {
++			errs = append(errs, fmt.Errorf("error while calling Unreserve action of extender %s: %v", extender.Name(), err))
++		}
++	}
++
++	return errors.NewAggregate(errs)
++}
++
+ // selectHost takes a prioritized list of nodes and then picks one
+ // in a reservoir sampling manner from the nodes that had the highest score.
+ func (g *genericScheduler) selectHost(nodeScoreList framework.NodeScoreList) (string, error) {
+diff --git a/pkg/scheduler/factory_test.go b/pkg/scheduler/factory_test.go
+index 9694ca3c4b3..a5401c36881 100644
+--- a/pkg/scheduler/factory_test.go
++++ b/pkg/scheduler/factory_test.go
+@@ -710,6 +710,22 @@ func (f *fakeExtender) IsInterested(pod *v1.Pod) bool {
+ 	return pod != nil && pod.Name == f.interestedPodName
+ }
+ 
++func (f *fakeExtender) SupportsPrebind() bool {
++	return false
++}
++
++func (f *fakeExtender) SupportsUnreserve() bool {
++	return false
++}
++
++func (f *fakeExtender) Prebind(binding *v1.Binding) error {
++	return nil
++}
++
++func (f *fakeExtender) Unreserve(binding *v1.Binding) error {
++	return nil
++}
++
+ type TestPlugin struct {
+ 	name string
+ }
+diff --git a/pkg/scheduler/framework/extender.go b/pkg/scheduler/framework/extender.go
+index d47c89bf1e4..6d783fcad1c 100644
+--- a/pkg/scheduler/framework/extender.go
++++ b/pkg/scheduler/framework/extender.go
+@@ -43,6 +43,12 @@ type Extender interface {
+ 	// Bind delegates the action of binding a pod to a node to the extender.
+ 	Bind(binding *v1.Binding) error
+ 
++	// Prebind delegates the action of prebinding a pod to a node to the extender.
++	Prebind(binding *v1.Binding) error
++
++	// Unreserve delegates the action of unreserving a pod to a node to the extender.
++	Unreserve(binding *v1.Binding) error
++
+ 	// IsBinder returns whether this extender is configured for the Bind method.
+ 	IsBinder() bool
+ 
+@@ -69,4 +75,10 @@ type Extender interface {
+ 	// IsIgnorable returns true indicates scheduling should not fail when this extender
+ 	// is unavailable. This gives scheduler ability to fail fast and tolerate non-critical extenders as well.
+ 	IsIgnorable() bool
++
++	// SupportsPrebind returns if the scheduler extender support prebind or not.
++	SupportsPrebind() bool
++
++	// SupportsUnreserve returns if the scheduler extender support unreserve or not.
++	SupportsUnreserve() bool
+ }
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index 432cf490e93..d16cc123d08 100755
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -589,9 +589,38 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
+ 			return
+ 		}
+ 
+-		err := sched.bind(bindingCycleCtx, fwk, assumedPod, scheduleResult.SuggestedHost, state)
++		// Call "prebind" extenders
++		binding := &v1.Binding{
++			ObjectMeta: metav1.ObjectMeta{Namespace: assumedPod.Namespace, Name: assumedPod.Name, UID: assumedPod.UID},
++			Target: v1.ObjectReference{
++				Kind: "Node",
++				Name: scheduleResult.SuggestedHost,
++			},
++		}
++		calledExtenders, err := sched.Algorithm.Prebind(assumedPod, binding)
++		if err != nil {
++			klog.Errorf("error while calling prebind extenders for pod %v: %v", assumedPod.Name, err)
++			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
++			// trigger un-reserve plugins to clean up state associated with the reserved Pod
++			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
++			if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
++				klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
++			}
++			sched.recordSchedulingFailure(fwk, assumedPodInfo, err, SchedulerError, "")
++			return
++		}
++
++		err = sched.bind(bindingCycleCtx, fwk, assumedPod, scheduleResult.SuggestedHost, state)
+ 		if err != nil {
+ 			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
++
++			if len(calledExtenders) > 0 {
++				err := sched.Algorithm.Unreserve(assumedPod, binding, calledExtenders)
++				if err != nil {
++					klog.Errorf("failed to do Unreserve:: %v", err)
++				}
++			}
++
+ 			// trigger un-reserve plugins to clean up state associated with the reserved Pod
+ 			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+ 			if err := sched.SchedulerCache.ForgetPod(assumedPod); err != nil {
+diff --git a/pkg/scheduler/scheduler_test.go b/pkg/scheduler/scheduler_test.go
+index ac73f758193..f5f71ca7400 100644
+--- a/pkg/scheduler/scheduler_test.go
++++ b/pkg/scheduler/scheduler_test.go
+@@ -120,6 +120,14 @@ func (es mockScheduler) Extenders() []framework.Extender {
+ 	return nil
+ }
+ 
++func (es mockScheduler) Prebind(*v1.Pod, *v1.Binding) ([]framework.Extender, error) {
++	return nil, nil
++}
++
++func (es mockScheduler) Unreserve(*v1.Pod, *v1.Binding, []framework.Extender) error {
++	return nil
++}
++
+ func TestSchedulerCreation(t *testing.T) {
+ 	invalidRegistry := map[string]frameworkruntime.PluginFactory{
+ 		defaultbinder.Name: defaultbinder.New,
+diff --git a/pkg/scheduler/testing/fake_extender.go b/pkg/scheduler/testing/fake_extender.go
+index 0422fc55d52..97f11682bfc 100644
+--- a/pkg/scheduler/testing/fake_extender.go
++++ b/pkg/scheduler/testing/fake_extender.go
+@@ -171,6 +171,18 @@ func (f *FakeExtender) SupportsPreemption() bool {
+ 	return true
+ }
+ 
++// SupportsPrebind returns true if an extender supports prebind.
++// An extender should have prebind verb defined and enabled its own node cache.
++func (h *FakeExtender) SupportsPrebind() bool {
++	return false
++}
++
++// SupportsUnreserve returns true if an extender supports unreserve.
++// An extender should have unreserve Verb verb defined and enabled its own node cache.
++func (h *FakeExtender) SupportsUnreserve() bool {
++	return false
++}
++
+ // ProcessPreemption implements the extender preempt function.
+ func (f *FakeExtender) ProcessPreemption(
+ 	pod *v1.Pod,
+@@ -363,6 +375,16 @@ func (f *FakeExtender) Bind(binding *v1.Binding) error {
+ 	return nil
+ }
+ 
++// Prebind implements the extender Preind function.
++func (f *FakeExtender) Prebind(binding *v1.Binding) error {
++	return nil
++}
++
++// Unreserve implements the extender Unreserve function.
++func (f *FakeExtender) Unreserve(binding *v1.Binding) error {
++	return nil
++}
++
+ // IsBinder returns true indicating the extender implements the Binder function.
+ func (f *FakeExtender) IsBinder() bool {
+ 	return true
+diff --git a/staging/src/k8s.io/kube-scheduler/config/v1/types.go b/staging/src/k8s.io/kube-scheduler/config/v1/types.go
+index 353bab4a384..1e956981b78 100644
+--- a/staging/src/k8s.io/kube-scheduler/config/v1/types.go
++++ b/staging/src/k8s.io/kube-scheduler/config/v1/types.go
+@@ -203,6 +203,10 @@ type LegacyExtender struct {
+ 	// If this method is implemented by the extender, it is the extender's responsibility to bind the pod to apiserver. Only one extender
+ 	// can implement this function.
+ 	BindVerb string `json:"bindVerb,omitempty"`
++	// Verb for the prebind call, empty if not supported. This verb is appended to the URLPrefix when issuing the prebind call to extender.
++	PrebindVerb string `json:"prebindVerb,omitempty"`
++	// Verb for the unreserve call, empty if not supported. This verb is appended to the URLPrefix when issuing the bind call to extender.
++	UnreserveVerb string `json:"unreserveVerb,omitempty"`
+ 	// EnableHTTPS specifies whether https should be used to communicate with the extender
+ 	EnableHTTPS bool `json:"enableHttps,omitempty"`
+ 	// TLSConfig specifies the transport layer security config
+diff --git a/staging/src/k8s.io/kube-scheduler/config/v1beta1/types.go b/staging/src/k8s.io/kube-scheduler/config/v1beta1/types.go
+index b98090a1055..69eac9ff735 100644
+--- a/staging/src/k8s.io/kube-scheduler/config/v1beta1/types.go
++++ b/staging/src/k8s.io/kube-scheduler/config/v1beta1/types.go
+@@ -281,6 +281,10 @@ type Extender struct {
+ 	// If this method is implemented by the extender, it is the extender's responsibility to bind the pod to apiserver. Only one extender
+ 	// can implement this function.
+ 	BindVerb string `json:"bindVerb,omitempty"`
++	// Verb for the prebind call, empty if not supported. This verb is appended to the URLPrefix when issuing the prebind call to extender.
++	PrebindVerb string `json:"prebindVerb,omitempty"`
++	// Verb for the unreserve call, empty if not supported. This verb is appended to the URLPrefix when issuing the bind call to extender.
++	UnreserveVerb string `json:"unreserveVerb,omitempty"`
+ 	// EnableHTTPS specifies whether https should be used to communicate with the extender
+ 	EnableHTTPS bool `json:"enableHTTPS,omitempty"`
+ 	// TLSConfig specifies the transport layer security config
